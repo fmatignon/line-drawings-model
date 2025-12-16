@@ -108,15 +108,49 @@ def setup_lora(unet):
 
 
 def main():
-    # Setup accelerator for mixed precision
-    accelerator = Accelerator(mixed_precision="fp16")
-    device = accelerator.device
+    # Explicitly check for CUDA availability
+    if torch.cuda.is_available():
+        print(f"CUDA available! Using GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(
+            f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
+        )
+        # Use fp16 mixed precision for CUDA (saves memory and speeds up training)
+        mixed_precision = "fp16"
+    else:
+        print("Warning: CUDA not available, using CPU (training will be very slow)")
+        print("Make sure you have CUDA-enabled PyTorch installed for Windows")
+        mixed_precision = "no"
 
-    # Load dataset
-    dataset = PairedImageDataset(
+    # Setup accelerator for mixed precision
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+    device = accelerator.device
+    print(f"Training device: {device}")
+
+    # Load dataset and split into train/validation
+    full_dataset = PairedImageDataset(
         "dataset/originals", "dataset/line_drawings", size=IMAGE_SIZE
     )
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    # Split: use 10 images for validation, rest for training
+    total_size = len(full_dataset)
+    val_size = min(10, total_size)
+    train_size = total_size - val_size
+
+    # Create train and validation datasets
+    train_indices = list(range(train_size))
+    val_indices = list(range(train_size, total_size))
+
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+
+    print(
+        f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}"
+    )
+
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # Load pipeline
     print("Loading Stable Diffusion 1.5...")
@@ -142,8 +176,10 @@ def main():
     criterion = torch.nn.L1Loss()
 
     # Prepare for training
-    pipe.vae, pipe.unet, optimizer, dataloader = accelerator.prepare(
-        pipe.vae, pipe.unet, optimizer, dataloader
+    pipe.vae, pipe.unet, optimizer, train_dataloader, val_dataloader = (
+        accelerator.prepare(
+            pipe.vae, pipe.unet, optimizer, train_dataloader, val_dataloader
+        )
     )
 
     # Training loop
@@ -151,10 +187,12 @@ def main():
     pipe.unet.train()
 
     for epoch in range(NUM_EPOCHS):
-        epoch_loss = 0.0
-        num_batches = 0
+        # Training phase
+        pipe.unet.train()
+        train_loss = 0.0
+        num_train_batches = 0
 
-        for batch_idx, (originals, targets) in enumerate(dataloader):
+        for batch_idx, (originals, targets) in enumerate(train_dataloader):
             originals = originals.to(device)
             targets = targets.to(device)
 
@@ -211,14 +249,82 @@ def main():
             optimizer.step()
             optimizer.zero_grad()
 
-            epoch_loss += loss.item()
-            num_batches += 1
+            train_loss += loss.item()
+            num_train_batches += 1
 
-        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
-        print(f"Epoch {epoch + 1}/{NUM_EPOCHS}, Loss: {avg_loss:.6f}")
+        avg_train_loss = (
+            train_loss / num_train_batches if num_train_batches > 0 else 0.0
+        )
+
+        # Validation phase
+        pipe.unet.eval()
+        val_loss = 0.0
+        num_val_batches = 0
+
+        with torch.no_grad():
+            for originals, targets in val_dataloader:
+                originals = originals.to(device)
+                targets = targets.to(device)
+
+                # Encode target images to latent space using VAE
+                target_latents = pipe.vae.encode(targets).latent_dist.sample()
+                target_latents = target_latents * pipe.vae.config.scaling_factor
+
+                # Standard SD training: add noise to target and predict noise
+                noise = torch.randn_like(target_latents)
+                timesteps = torch.randint(
+                    0,
+                    pipe.scheduler.config.num_train_timesteps,
+                    (target_latents.shape[0],),
+                    device=device,
+                )
+                noisy_latents = pipe.scheduler.add_noise(
+                    target_latents, noise, timesteps
+                )
+
+                # Dummy prompt for text conditioning
+                prompt = ""
+                tokenizer = pipe.tokenizer
+                text_encoder = pipe.text_encoder
+                text_inputs = tokenizer(
+                    prompt,
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
+
+                # Forward pass through UNet
+                model_pred = pipe.unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=text_embeddings,
+                ).sample
+
+                # Predict noise (SD training objective)
+                if pipe.scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif pipe.scheduler.config.prediction_type == "v_prediction":
+                    target = pipe.scheduler.get_velocity(
+                        target_latents, noise, timesteps
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown prediction type {pipe.scheduler.config.prediction_type}"
+                    )
+
+                loss = criterion(model_pred, target)
+                val_loss += loss.item()
+                num_val_batches += 1
+
+        avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0.0
+        print(
+            f"Epoch {epoch + 1}/{NUM_EPOCHS}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+        )
 
         # Early stopping if loss plateaus (simple check)
-        if epoch > 10 and avg_loss < 0.01:
+        if epoch > 10 and avg_train_loss < 0.01:
             print(f"Loss converged, stopping early at epoch {epoch + 1}")
             break
 
