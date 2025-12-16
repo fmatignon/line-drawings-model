@@ -190,7 +190,10 @@ def main():
             # Encode target images to latent space using VAE
             with torch.no_grad():
                 # VAE expects input in [-1, 1] range, which we already have
-                target_latents = pipe.vae.encode(targets).latent_dist.sample()
+                # Convert to VAE's dtype (fp16 if using mixed precision)
+                vae_dtype = next(pipe.vae.parameters()).dtype
+                targets_encoded = targets.to(dtype=vae_dtype)
+                target_latents = pipe.vae.encode(targets_encoded).latent_dist.sample()
                 target_latents = target_latents * pipe.vae.config.scaling_factor
 
             # Standard SD training: add noise to target and predict noise
@@ -258,7 +261,10 @@ def main():
                 targets = targets.to(device)
 
                 # Encode target images to latent space using VAE
-                target_latents = pipe.vae.encode(targets).latent_dist.sample()
+                # Convert to VAE's dtype (fp16 if using mixed precision)
+                vae_dtype = next(pipe.vae.parameters()).dtype
+                targets_encoded = targets.to(dtype=vae_dtype)
+                target_latents = pipe.vae.encode(targets_encoded).latent_dist.sample()
                 target_latents = target_latents * pipe.vae.config.scaling_factor
 
                 # Standard SD training: add noise to target and predict noise
