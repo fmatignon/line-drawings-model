@@ -3,3 +3,4 @@ diffusers>=0.21.0
 transformers>=4.30.0
 Pillow>=9.0.0
 accelerate>=0.20.0
+huggingface_hub[hf_xet]
