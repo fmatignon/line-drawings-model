@@ -155,13 +155,16 @@ def main():
     print("Setting up LoRA adapters...")
     setup_lora(pipe.unet)
 
-    # Convert to fp16 AFTER LoRA setup if using mixed precision
-    # This ensures LoRA parameters are properly initialized
+    # For mixed precision: keep LoRA parameters in fp32 for stable gradients
+    # The base UNet can be in fp16, but LoRA params stay fp32
     if accelerator.mixed_precision == "fp16":
-        print("Converting to fp16...")
-        # Convert UNet (including LoRA layers) to fp16
-        pipe.unet = pipe.unet.to(dtype=torch.float16)
-        # VAE can stay in fp16 for encoding/decoding
+        print("Converting base model to fp16 (keeping LoRA in fp32)...")
+        # Convert base UNet to fp16, but explicitly keep LoRA params in fp32
+        for name, param in pipe.unet.named_parameters():
+            if "lora" not in name.lower():
+                # Only convert non-LoRA parameters to fp16
+                param.data = param.data.to(dtype=torch.float16)
+        # VAE can be in fp16 for encoding/decoding
         pipe.vae = pipe.vae.to(dtype=torch.float16)
 
     # Setup optimizer - only train LoRA parameters
@@ -248,8 +251,13 @@ def main():
             accelerator.backward(loss)
 
             # Clip gradients to prevent explosion
+            # Use torch's clip_grad_norm_ directly to avoid Accelerate's unscaling issues
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
+                # Get only trainable parameters that have gradients
+                params_with_grad = [p for p in trainable_params if p.grad is not None]
+                if params_with_grad:
+                    # Use torch's clip_grad_norm_ directly (works with fp32 gradients)
+                    torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=1.0)
 
             optimizer.step()
             optimizer.zero_grad()
