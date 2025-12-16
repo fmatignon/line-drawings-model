@@ -139,11 +139,10 @@ def main():
 
     # Load pipeline
     print("Loading Stable Diffusion 1.5...")
+    # Load in float32 first to ensure LoRA adapters are created in fp32
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.float16
-        if accelerator.mixed_precision == "fp16"
-        else torch.float32,
+        torch_dtype=torch.float32,  # Load in float32 first
     )
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
@@ -152,9 +151,18 @@ def main():
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
 
-    # Setup LoRA
+    # Setup LoRA in fp32 first
     print("Setting up LoRA adapters...")
     setup_lora(pipe.unet)
+
+    # Convert to fp16 AFTER LoRA setup if using mixed precision
+    # This ensures LoRA parameters are properly initialized
+    if accelerator.mixed_precision == "fp16":
+        print("Converting to fp16...")
+        # Convert UNet (including LoRA layers) to fp16
+        pipe.unet = pipe.unet.to(dtype=torch.float16)
+        # VAE can stay in fp16 for encoding/decoding
+        pipe.vae = pipe.vae.to(dtype=torch.float16)
 
     # Setup optimizer - only train LoRA parameters
     # Filter to get only LoRA parameters (those that require grad)
@@ -238,6 +246,11 @@ def main():
 
             # Backward pass
             accelerator.backward(loss)
+
+            # Clip gradients to prevent explosion
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
+
             optimizer.step()
             optimizer.zero_grad()
 
