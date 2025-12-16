@@ -130,9 +130,10 @@ def main():
     )
     pipe = pipe.to(device)
     
-    # Load LoRA weights
+    # Load LoRA weights using PEFT (matches training setup)
     print("Loading LoRA weights...")
-    pipe.unet.load_attn_procs(LORA_WEIGHTS_DIR)
+    from peft import PeftModel
+    pipe.unet = PeftModel.from_pretrained(pipe.unet, LORA_WEIGHTS_DIR)
     
     # Preprocess input image
     print(f"Processing {input_path}...")

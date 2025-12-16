@@ -184,6 +184,7 @@ def main():
 
     # Training loop
     print(f"Starting training for {NUM_EPOCHS} epochs...")
+    print(f"Training on {len(train_dataloader)} batches per epoch")
     pipe.unet.train()
 
     for epoch in range(NUM_EPOCHS):
@@ -193,6 +194,12 @@ def main():
         num_train_batches = 0
 
         for batch_idx, (originals, targets) in enumerate(train_dataloader):
+            # Print progress every 10 batches
+            if batch_idx % 10 == 0:
+                print(
+                    f"Epoch {epoch + 1}/{NUM_EPOCHS}, Batch {batch_idx}/{len(train_dataloader)}",
+                    flush=True,
+                )
             originals = originals.to(device)
             targets = targets.to(device)
 
@@ -336,8 +343,16 @@ def main():
 
         avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0.0
         print(
-            f"Epoch {epoch + 1}/{NUM_EPOCHS}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+            f"Epoch {epoch + 1}/{NUM_EPOCHS}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}",
+            flush=True,
         )
+
+        # Loss interpretation hints
+        if epoch == 0:
+            print(
+                "  (Lower is better. Target: Train < 0.03, Val < 0.05. Watch for overfitting if Val >> Train)",
+                flush=True,
+            )
 
         # Early stopping if loss plateaus (simple check)
         if epoch > 10 and avg_train_loss < 0.01:
