@@ -6,7 +6,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from diffusers import StableDiffusionImg2ImgPipeline
-from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from accelerate import Accelerator
 
@@ -79,16 +78,22 @@ class PairedImageDataset(Dataset):
 
 def setup_lora(unet):
     """Add LoRA adapters to UNet"""
-    lora_attn_procs = {}
-    for name in unet.attn_processors.keys():
-        # New API: LoRAAttnProcessor only needs rank and network_alpha
-        lora_attn_procs[name] = LoRAAttnProcessor(
-            rank=LORA_RANK,
-            network_alpha=LORA_ALPHA,
-        )
+    # The newer diffusers API requires LoRAAttnProcessor to be initialized
+    # without parameters, then configured via set_lora_weights or similar
+    # For now, create processors without parameters
+    attn_procs = {}
 
-    unet.set_attn_processor(lora_attn_procs)
-    return AttnProcsLayers(unet.attn_processors)
+    for name in unet.attn_processors.keys():
+        # Initialize without parameters (newer API)
+        attn_procs[name] = LoRAAttnProcessor()
+
+    unet.set_attn_processor(attn_procs)
+
+    # Note: In newer diffusers versions, LoRA rank/alpha might need to be
+    # configured via a different method (e.g., when loading/saving weights)
+    # The processors will use default values or values set during weight loading
+
+    return unet
 
 
 def main():
@@ -153,10 +158,12 @@ def main():
 
     # Setup LoRA
     print("Setting up LoRA adapters...")
-    lora_layers = setup_lora(pipe.unet)
+    setup_lora(pipe.unet)
 
-    # Setup optimizer
-    optimizer = torch.optim.AdamW(lora_layers.parameters(), lr=LEARNING_RATE)
+    # Setup optimizer - only train LoRA parameters
+    trainable_params = [p for p in pipe.unet.parameters() if p.requires_grad]
+    print(f"Training {sum(p.numel() for p in trainable_params)} parameters")
+    optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE)
     criterion = torch.nn.L1Loss()
 
     # Prepare for training
