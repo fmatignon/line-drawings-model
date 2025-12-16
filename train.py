@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from diffusers import StableDiffusionImg2ImgPipeline
-from diffusers.models.attention_processor import LoRAAttnProcessor
+from peft import LoraConfig
 from accelerate import Accelerator
 
 # Hardcoded hyperparameters
@@ -77,21 +77,17 @@ class PairedImageDataset(Dataset):
 
 
 def setup_lora(unet):
-    """Add LoRA adapters to UNet"""
-    # The newer diffusers API requires LoRAAttnProcessor to be initialized
-    # without parameters, then configured via set_lora_weights or similar
-    # For now, create processors without parameters
-    attn_procs = {}
+    """Add LoRA adapters to UNet using PEFT"""
+    # Configure LoRA using PEFT (modern diffusers approach)
+    lora_config = LoraConfig(
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
 
-    for name in unet.attn_processors.keys():
-        # Initialize without parameters (newer API)
-        attn_procs[name] = LoRAAttnProcessor()
-
-    unet.set_attn_processor(attn_procs)
-
-    # Note: In newer diffusers versions, LoRA rank/alpha might need to be
-    # configured via a different method (e.g., when loading/saving weights)
-    # The processors will use default values or values set during weight loading
+    # Add LoRA adapter to UNet
+    unet.add_adapter(lora_config)
 
     return unet
 
@@ -161,8 +157,10 @@ def main():
     setup_lora(pipe.unet)
 
     # Setup optimizer - only train LoRA parameters
-    trainable_params = [p for p in pipe.unet.parameters() if p.requires_grad]
-    print(f"Training {sum(p.numel() for p in trainable_params)} parameters")
+    # Filter to get only LoRA parameters (those that require grad)
+    lora_layers = filter(lambda p: p.requires_grad, pipe.unet.parameters())
+    trainable_params = list(lora_layers)
+    print(f"Training {sum(p.numel() for p in trainable_params)} LoRA parameters")
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE)
     criterion = torch.nn.L1Loss()
 
@@ -329,7 +327,8 @@ def main():
     print("Saving LoRA weights...")
     os.makedirs("lora_weights", exist_ok=True)
     unwrapped_unet = accelerator.unwrap_model(pipe.unet)
-    unwrapped_unet.save_attn_procs("lora_weights")
+    # Save using PEFT's save_pretrained method
+    unwrapped_unet.save_pretrained("lora_weights")
     print("Training complete! LoRA weights saved to lora_weights/")
 
 
