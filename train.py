@@ -255,19 +255,28 @@ def main():
             ).sample
 
             # Predict noise that transforms original → target
-            # The model should learn: given noisy_original, predict noise to get target
+            # For img2img: we want to predict noise that, when removed from noisy_original, gives target
+            # The target noise is: what noise bridges noisy_original to target_latents
             if pipe.scheduler.config.prediction_type == "epsilon":
-                # Calculate target noise: what noise bridges noisy_original → target
-                # Using the scheduler's reverse process: target_noise = (noisy - target * alpha) / sigma
-                alphas_cumprod = pipe.scheduler.alphas_cumprod[timesteps].view(
-                    -1, 1, 1, 1
-                )
+                # Calculate: if we have noisy_original and want target, what noise should we predict?
+                # Reverse formula: target = (noisy - sqrt(1-alpha) * noise) / sqrt(alpha)
+                # So: noise = (noisy - sqrt(alpha) * target) / sqrt(1-alpha)
+                alphas_cumprod = pipe.scheduler.alphas_cumprod[timesteps]
+                # Handle batched timesteps
+                if len(alphas_cumprod.shape) == 0:
+                    alphas_cumprod = alphas_cumprod.unsqueeze(0)
+                alphas_cumprod = alphas_cumprod.view(-1, 1, 1, 1)
+
+                sqrt_alpha = alphas_cumprod.sqrt()
+                sqrt_one_minus_alpha = (1 - alphas_cumprod).sqrt()
+
+                # Target noise: what noise transforms noisy_original → target
                 target_noise = (
-                    noisy_latents - target_latents * alphas_cumprod.sqrt()
-                ) / (1 - alphas_cumprod).sqrt()
+                    noisy_latents - target_latents * sqrt_alpha
+                ) / sqrt_one_minus_alpha
                 target = target_noise
             elif pipe.scheduler.config.prediction_type == "v_prediction":
-                # For v-prediction, calculate velocity that transforms original → target
+                # For v-prediction, use velocity
                 target = pipe.scheduler.get_velocity(target_latents, noise, timesteps)
             else:
                 raise ValueError(

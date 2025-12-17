@@ -9,9 +9,9 @@ from diffusers import StableDiffusionImg2ImgPipeline
 IMAGE_SIZE = 512
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
 LORA_WEIGHTS_DIR = "lora_weights"
-STRENGTH = 0.8
-GUIDANCE_SCALE = 1.0
-NUM_INFERENCE_STEPS = 20
+STRENGTH = 0.9  # Higher strength for more transformation
+GUIDANCE_SCALE = 7.5  # Higher guidance for better adherence to learned style
+NUM_INFERENCE_STEPS = 50  # More steps for better quality
 
 
 def preprocess_image(image_path, size=512):
@@ -83,16 +83,34 @@ def postprocess_to_bw(image_tensor):
     else:
         gray = arr
 
-    # Apply Otsu's threshold for clean black/white
-    threshold = otsu_threshold(gray)
-    binary = (gray > threshold).astype(np.uint8) * 255
+    # Less aggressive post-processing: preserve grayscale values
+    # Only apply light thresholding to enhance contrast, not pure binarization
+    # The targets have grayscale (42 unique values), so we should preserve that
+
+    # Apply gentle contrast enhancement instead of hard thresholding
+    # Normalize to ensure good contrast without losing grayscale detail
+    gray_min, gray_max = gray.min(), gray.max()
+    if gray_max > gray_min:
+        gray_normalized = ((gray - gray_min) / (gray_max - gray_min) * 255).astype(
+            np.uint8
+        )
+    else:
+        gray_normalized = gray
+
+    # Optional: light thresholding to clean up but preserve grayscale
+    # Use a softer threshold (keep more grayscale values)
+    threshold = otsu_threshold(gray_normalized)
+    # Apply threshold but keep some grayscale - use a softer approach
+    # Instead of pure binary, use threshold as a guide for enhancement
+    enhanced = np.clip(
+        (gray_normalized.astype(float) - threshold) * 2 + 128, 0, 255
+    ).astype(np.uint8)
 
     # Invert if needed (ensure black lines on white background)
-    # Check if most pixels are dark (should be inverted)
-    if np.mean(binary) < 128:
-        binary = 255 - binary
+    if np.mean(enhanced) < 128:
+        enhanced = 255 - enhanced
 
-    return Image.fromarray(binary, mode="L").convert("RGB")
+    return Image.fromarray(enhanced, mode="L").convert("RGB")
 
 
 def main():
