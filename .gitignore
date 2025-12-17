@@ -58,8 +58,6 @@ coverage.xml
 .mypy_cache/
 
 # Data files
-dataset/originals/
-dataset/line_drawings/
 dataset/line_drawings.ai
 
 # OS files
