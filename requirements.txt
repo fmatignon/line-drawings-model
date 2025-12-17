@@ -4,3 +4,5 @@ torchaudio
 opencv-python-headless
 numpy
 pillow
+dominate
+wandb
