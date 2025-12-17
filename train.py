@@ -14,18 +14,148 @@ from pytorch_msssim import ssim
 # Import model and edge detection from separate module
 from model import UNet, detect_edges
 
+
+class ConditionalUNet(nn.Module):
+    """
+    Conditional UNet for diffusion: conditions on edge-detected input image.
+
+    WHY DIFFUSION FOR LINE DRAWINGS:
+    - Regression models (pixel-wise loss) struggle with sparse line drawings
+    - Diffusion models excel at generating complete structures through iterative denoising
+    - The denoising process naturally encourages shape closure and topology completion
+    - Missing lines are penalized at every denoising step, not just final output
+
+    CONDITIONING APPROACH:
+    - Concatenate edge image (3 channels) with noisy target (1 channel) = 4 input channels
+    - UNet learns to predict noise that, when removed, produces line drawing matching edge structure
+    - This ensures generated lines follow the edge-detected geometry
+    """
+
+    def __init__(self, base_unet):
+        super(ConditionalUNet, self).__init__()
+        self.base_unet = base_unet
+
+        # Modify first layer to accept 4 channels (3 edge + 1 noisy target)
+        # Get original conv_in properties
+        original_conv = base_unet.enc1[0]
+        in_channels = 4  # 3 (edge) + 1 (noisy target)
+        out_channels = original_conv.out_channels
+        kernel_size = original_conv.kernel_size
+        stride = original_conv.stride
+        padding = original_conv.padding
+
+        # Create new first conv layer
+        new_conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+
+        # Initialize: copy weights for first 3 channels (edge), zero for 4th (noisy target)
+        with torch.no_grad():
+            new_conv.weight[:, :3, :, :].copy_(original_conv.weight[:, :3, :, :])
+            new_conv.weight[:, 3:, :, :].zero_()
+            if original_conv.bias is not None:
+                new_conv.bias = nn.Parameter(original_conv.bias.clone())
+
+        # Replace first conv in enc1
+        base_unet.enc1[0] = new_conv
+
+    def forward(self, noisy_target, edge_image, timestep):
+        """
+        Forward pass for conditional diffusion.
+
+        Args:
+            noisy_target: [B, 1, H, W] - noisy line drawing at timestep t
+            edge_image: [B, 3, H, W] - edge-detected input image (conditioning)
+            timestep: [B] - diffusion timestep (0 to NUM_DIFFUSION_TIMESTEPS-1)
+                     Currently unused but kept for future timestep embedding
+
+        Returns:
+            predicted_noise: [B, 1, H, W] - predicted noise to remove
+        """
+        # Concatenate edge image with noisy target
+        # Shape: [B, 4, H, W] = [B, 3 (edge) + 1 (noisy), H, W]
+        conditioned_input = torch.cat([edge_image, noisy_target], dim=1)
+
+        # For now, ignore timestep embedding (can add later if needed)
+        # The UNet will learn to denoise based on the conditioning alone
+        # The base_unet's sigmoid was already removed in create_conditional_unet
+        predicted_noise = self.base_unet(conditioned_input)
+
+        return predicted_noise
+
+
+class DDPMScheduler:
+    """
+    Simple DDPM noise scheduler for forward diffusion.
+
+    HOW DIFFUSION WORKS:
+    1. Forward process: gradually add noise to clean line drawing
+       x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon
+    2. Training: model learns to predict epsilon (noise) given noisy x_t and conditioning
+    3. Inference: iteratively denoise from pure noise, conditioned on edge image
+       - Start with random noise
+       - At each step, predict and remove noise
+       - After T steps, recover clean line drawing
+
+    This iterative process naturally encourages complete structures and shape closure.
+    """
+
+    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02):
+        self.num_timesteps = num_timesteps
+
+        # Linear noise schedule
+        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+
+        # Precompute for efficiency
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+
+    def add_noise(self, x_0, noise, timesteps):
+        """
+        Add noise to clean image x_0 at given timesteps.
+
+        Args:
+            x_0: [B, C, H, W] - clean image
+            noise: [B, C, H, W] - noise to add
+            timesteps: [B] - timestep indices
+
+        Returns:
+            x_t: [B, C, H, W] - noisy image
+        """
+        # Move to same device as inputs
+        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(x_0.device)
+        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(
+            x_0.device
+        )
+
+        # Get alpha values for each sample in batch
+        sqrt_alphas_cumprod_t = sqrt_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod[timesteps].view(
+            -1, 1, 1, 1
+        )
+
+        # Forward diffusion: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon
+        x_t = sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
+
+        return x_t
+
+    def sample_timesteps(self, batch_size, device):
+        """Sample random timesteps for training."""
+        return torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+
 # Hyperparameters
 IMAGE_SIZE = 512
-BATCH_SIZE = 4
+BATCH_SIZE = 2  # Reduced for diffusion (more memory intensive)
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 200
 EARLY_STOPPING_PATIENCE = 10
 
-# Loss weights - tuned to prioritize structural line fidelity
-LOSS_WEIGHT_PIXEL = 0.2  # Downweighted: stabilizer, not main driver
-LOSS_WEIGHT_EDGE = 0.4  # High weight: forces correct geometry/contour placement
-LOSS_WEIGHT_LINE_PRESENCE = 0.3  # High weight: strongly punishes missing strokes
-LOSS_WEIGHT_THICKNESS = 0.1  # Low weight: discourages ultra-thin/broken lines
+# Diffusion hyperparameters
+NUM_DIFFUSION_TIMESTEPS = 1000  # Standard DDPM timesteps
+BETA_START = 0.0001  # Noise schedule start
+BETA_END = 0.02  # Noise schedule end
 
 
 class PairedImageDataset(Dataset):
@@ -133,6 +263,17 @@ class PairedImageDataset(Dataset):
         return (target_tensor > threshold).float()
 
 
+def create_conditional_unet(base_unet):
+    """
+    Create conditional UNet that accepts edge image as conditioning.
+    Modifies the base UNet to accept 4 channels (3 edge + 1 noisy target).
+    """
+    # Create a copy of base UNet structure but modify first layer
+    # We'll modify it in-place to accept 4 channels
+    conditional_unet = ConditionalUNet(base_unet)
+    return conditional_unet
+
+
 def compute_edge_loss(pred, target):
     """
     Edge-aware loss: penalize missing edges more than extra pixels.
@@ -235,16 +376,16 @@ def compute_thickness_consistency_loss(pred, target, blur_kernel_size=3):
 def save_validation_samples(samples, epoch, device):
     """
     Save validation samples for visual debugging.
-    Creates side-by-side comparison: input | ground truth | model output
+    Creates side-by-side comparison: edge input | ground truth | model output
     """
-    inputs, targets, outputs = samples
+    edge_images, targets, outputs = samples
 
     # Create output directory
     output_dir = Path("outputs")
     output_dir.mkdir(exist_ok=True)
 
     # Process first sample in batch
-    input_img = inputs[0]
+    edge_img = edge_images[0]
     target_img = targets[0]
     output_img = outputs[0]
 
@@ -262,14 +403,14 @@ def save_validation_samples(samples, epoch, device):
         else:
             return Image.fromarray(arr, mode="RGB")
 
-    input_pil = tensor_to_image(input_img)
+    edge_pil = tensor_to_image(edge_img)
     target_pil = tensor_to_image(target_img)
     output_pil = tensor_to_image(output_img)
 
     # Create side-by-side comparison
     # Width: 3 images * 512, Height: 512
     comparison = Image.new("RGB", (512 * 3, 512), (255, 255, 255))
-    comparison.paste(input_pil.convert("RGB"), (0, 0))
+    comparison.paste(edge_pil.convert("RGB"), (0, 0))
     comparison.paste(target_pil.convert("RGB"), (512, 0))
     comparison.paste(output_pil.convert("RGB"), (1024, 0))
 
@@ -460,11 +601,21 @@ def main():
         val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2
     )
 
-    # Initialize model
-    # NOTE: UNet output uses sigmoid activation (see model.py)
-    # This ensures outputs are in [0, 1] range, matching our binary-like targets
-    # and enabling BCE loss to work correctly.
-    model = UNet(in_channels=3, out_channels=1).to(device)
+    # Initialize base UNet (will be wrapped for conditioning)
+    # For diffusion, we need raw output (no sigmoid) to predict noise
+    base_unet = UNet(in_channels=3, out_channels=1)
+
+    # Remove sigmoid from final layer for noise prediction
+    # Noise can be negative, so we need unbounded output
+    base_unet.sigmoid = nn.Identity()  # Replace sigmoid with identity
+
+    # Wrap in conditional UNet that accepts edge image as conditioning
+    model = create_conditional_unet(base_unet).to(device)
+
+    print("Using conditional diffusion model (DDPM)")
+    print(f"  - Conditioning: edge-detected input image (3 channels)")
+    print(f"  - Target: line drawing (1 channel)")
+    print(f"  - Model predicts noise to remove from noisy target")
 
     # Initialize weights
     def init_weights(m):
@@ -483,7 +634,13 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
 
+    # Diffusion scheduler
+    diffusion_scheduler = DDPMScheduler(
+        num_timesteps=NUM_DIFFUSION_TIMESTEPS, beta_start=BETA_START, beta_end=BETA_END
+    )
+
     # Loss and optimizer
+    # For diffusion, we use simple MSE loss on predicted noise
     optimizer = torch.optim.Adam(
         model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=1e-5
     )
@@ -507,14 +664,31 @@ def main():
         train_loss = 0.0
         num_train_batches = 0
 
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+        for batch_idx, (edge_images, targets) in enumerate(train_loader):
+            # inputs are edge-detected images (3 channels), targets are line drawings (1 channel)
+            edge_images = edge_images.to(
+                device
+            )  # [B, 3, H, W] - edge-detected conditioning
+            targets = targets.to(device)  # [B, 1, H, W] - clean line drawings
 
-            # Forward pass
+            # DIFFUSION TRAINING:
+            # 1. Sample random timesteps
+            timesteps = diffusion_scheduler.sample_timesteps(
+                batch_size=edge_images.shape[0], device=device
+            )
+
+            # 2. Sample noise to add
+            noise = torch.randn_like(targets)  # [B, 1, H, W]
+
+            # 3. Add noise to clean targets (forward diffusion)
+            noisy_targets = diffusion_scheduler.add_noise(targets, noise, timesteps)
+
+            # 4. Predict noise conditioned on edge image
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = combined_loss(outputs, targets)  # Training: don't need components
+            predicted_noise = model(noisy_targets, edge_images, timesteps)
+
+            # 5. MSE loss on predicted noise (standard DDPM loss)
+            loss = F.mse_loss(predicted_noise, noise)
 
             # Backward pass
             loss.backward()
@@ -535,63 +709,61 @@ def main():
         # Validation phase
         model.eval()
         val_loss = 0.0
-        val_pixel_loss = 0.0
-        val_edge_loss = 0.0
-        val_line_presence_loss = 0.0
-        val_thickness_loss = 0.0
         val_coverage = 0.0
         num_val_batches = 0
         val_samples_to_save = []  # Store samples for visual debugging
 
         with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(val_loader):
-                inputs = inputs.to(device)
-                targets = targets.to(device)
+            for batch_idx, (edge_images, targets) in enumerate(val_loader):
+                edge_images = edge_images.to(device)  # [B, 3, H, W]
+                targets = targets.to(device)  # [B, 1, H, W]
 
-                outputs = model(inputs)
-                loss, loss_components = combined_loss(
-                    outputs, targets, return_components=True
+                # Validation: sample timesteps and compute diffusion loss
+                timesteps = diffusion_scheduler.sample_timesteps(
+                    batch_size=edge_images.shape[0], device=device
                 )
+                noise = torch.randn_like(targets)
+                noisy_targets = diffusion_scheduler.add_noise(targets, noise, timesteps)
+
+                predicted_noise = model(noisy_targets, edge_images, timesteps)
+                loss = F.mse_loss(predicted_noise, noise)
 
                 val_loss += loss.item()
-                val_pixel_loss += loss_components["pixel"]
-                val_edge_loss += loss_components["edge"]
-                val_line_presence_loss += loss_components["line_presence"]
-                val_thickness_loss += loss_components["thickness"]
 
-                # Compute line coverage metric
-                batch_coverage = 0.0
-                for i in range(outputs.shape[0]):
-                    batch_coverage += compute_line_coverage(
-                        outputs[i : i + 1], targets[i : i + 1]
-                    )
-                val_coverage += batch_coverage / outputs.shape[0]
+                # For coverage metric, we need to denoise a sample
+                # Use a simple single-step denoising approximation for validation
+                # (Full denoising would require running full diffusion process)
+                # Approximate: remove predicted noise from noisy target
+                with torch.no_grad():
+                    # Simple approximation: denoise using predicted noise
+                    # This is not the full diffusion process, just for metric
+                    denoised_approx = noisy_targets - predicted_noise
+                    denoised_approx = torch.clamp(denoised_approx, 0, 1)
+
+                    batch_coverage = 0.0
+                    for i in range(denoised_approx.shape[0]):
+                        batch_coverage += compute_line_coverage(
+                            denoised_approx[i : i + 1], targets[i : i + 1]
+                        )
+                    val_coverage += batch_coverage / denoised_approx.shape[0]
 
                 num_val_batches += 1
 
                 # Save first batch of validation samples for visual debugging
                 if batch_idx == 0 and epoch % 5 == 0:  # Every 5 epochs
-                    val_samples_to_save = (inputs.cpu(), targets.cpu(), outputs.cpu())
+                    val_samples_to_save = (
+                        edge_images.cpu(),
+                        targets.cpu(),
+                        denoised_approx.cpu(),
+                    )
 
         avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0.0
-        avg_val_pixel_loss = (
-            val_pixel_loss / num_val_batches if num_val_batches > 0 else 0.0
-        )
-        avg_val_edge_loss = (
-            val_edge_loss / num_val_batches if num_val_batches > 0 else 0.0
-        )
-        avg_val_line_presence_loss = (
-            val_line_presence_loss / num_val_batches if num_val_batches > 0 else 0.0
-        )
-        avg_val_thickness_loss = (
-            val_thickness_loss / num_val_batches if num_val_batches > 0 else 0.0
-        )
         avg_val_coverage = (
             val_coverage / num_val_batches if num_val_batches > 0 else 0.0
         )
 
-        # Composite metric for model selection: edge + line_presence (structural quality)
-        composite_metric = avg_val_edge_loss + avg_val_line_presence_loss
+        # For diffusion, use validation loss as the metric (MSE on noise prediction)
+        composite_metric = avg_val_loss
 
         # Visual debug output: save side-by-side comparison
         if val_samples_to_save and epoch % 5 == 0:
@@ -604,30 +776,24 @@ def main():
         if new_lr < old_lr:
             print(f"  -> Learning rate reduced: {old_lr:.2e} -> {new_lr:.2e}")
 
-        # Print epoch summary with individual loss components
+        # Print epoch summary
         print(
             f"Epoch {epoch + 1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
         )
         print(
-            f"  Val Components - Pixel: {avg_val_pixel_loss:.6f}, Edge: {avg_val_edge_loss:.6f}, "
-            f"LinePresence: {avg_val_line_presence_loss:.6f}, Thickness: {avg_val_thickness_loss:.6f}"
-        )
-        print(
-            f"  Val Coverage: {avg_val_coverage:.3f}, Composite Metric: {composite_metric:.6f}"
+            f"  Val Coverage: {avg_val_coverage:.3f} (MSE on noise prediction: {avg_val_loss:.6f})"
         )
 
         # Explain loss values
         if epoch == 0:
-            print("  NOTE: Pixel loss may plateau around 0.07-0.10 - this is EXPECTED.")
+            print("  NOTE: Diffusion model trains on noise prediction (MSE loss).")
             print(
-                "  Line drawings are sparse (~1-5% lines), so pixel loss doesn't capture structure."
+                "  Lower loss = better noise prediction = better line reconstruction."
             )
             print(
-                "  Watch 'Val Coverage' (target: >0.7) and 'Composite Metric' (edge + line_presence)."
+                "  Diffusion naturally encourages complete structures through iterative denoising."
             )
-            print(
-                "  Best model is selected based on composite metric, not pixel loss alone."
-            )
+            print("  Watch 'Val Coverage' (target: >0.7) to track line completeness.")
 
         # Save best model based on composite metric (edge + line_presence)
         # This ensures we select models with better structural output, not just low pixel loss
