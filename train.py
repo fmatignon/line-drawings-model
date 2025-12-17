@@ -21,6 +21,12 @@ LEARNING_RATE = 1e-4
 NUM_EPOCHS = 200
 EARLY_STOPPING_PATIENCE = 10
 
+# Loss weights - tuned to prioritize structural line fidelity
+LOSS_WEIGHT_PIXEL = 0.2  # Downweighted: stabilizer, not main driver
+LOSS_WEIGHT_EDGE = 0.4  # High weight: forces correct geometry/contour placement
+LOSS_WEIGHT_LINE_PRESENCE = 0.3  # High weight: strongly punishes missing strokes
+LOSS_WEIGHT_THICKNESS = 0.1  # Low weight: discourages ultra-thin/broken lines
+
 
 class PairedImageDataset(Dataset):
     def __init__(self, originals_dir, targets_dir, size=512, is_training=True):
@@ -158,24 +164,72 @@ def compute_edge_loss(pred, target):
     return edge_loss
 
 
-def dice_loss(pred, target, smooth=1e-6):
+def compute_line_presence_loss(pred, target, threshold=0.5):
     """
-    Dice loss: measures overlap between pred and target.
-    Particularly effective for binary segmentation tasks like line drawings.
-    Penalizes missing lines (false negatives) more than extra pixels (false positives).
-    """
-    # Flatten tensors
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
+    Line Presence / Coverage Loss: explicitly penalizes missing line pixels.
 
-    # Compute intersection and union
-    intersection = (pred_flat * target_flat).sum()
-    dice = (2.0 * intersection + smooth) / (
-        pred_flat.sum() + target_flat.sum() + smooth
+    WHY THIS EXISTS:
+    - Pixel loss treats all pixels equally, so missing sparse line pixels
+      has minimal impact on average error
+    - This loss converts both pred and target to binary masks and directly
+      penalizes missing predicted line pixels relative to target
+    - Strongly punishes missing strokes, forcing the model to produce complete lines
+
+    Implementation:
+    - Binarize both pred and target using fixed threshold
+    - Compute L1 loss on binary masks
+    - This gives equal weight to each line pixel, regardless of background density
+    """
+    # Convert to binary line masks
+    pred_binary = (pred > threshold).float()
+    target_binary = (target > threshold).float()
+
+    # L1 loss on binary masks - missing line pixels are directly penalized
+    line_presence_loss = F.l1_loss(pred_binary, target_binary)
+
+    return line_presence_loss
+
+
+def compute_thickness_consistency_loss(pred, target, blur_kernel_size=3):
+    """
+    Thickness Consistency Loss: encourages stable line thickness.
+
+    WHY THIS EXISTS:
+    - Ultra-thin, broken, or noisy lines are visually poor even if pixel-accurate
+    - Slight blurring smooths out thickness variations
+    - Loss on blurred maps discourages the model from producing fragile line structures
+
+    Implementation:
+    - Apply box blur (simple averaging) to both pred and target
+    - Compute L1 loss on blurred maps
+    - This encourages consistent line thickness and reduces noise
+    """
+    # Create box blur kernel (simple averaging filter)
+    # This approximates Gaussian blur and is faster
+    blur_kernel = torch.ones(
+        1, 1, blur_kernel_size, blur_kernel_size, dtype=pred.dtype, device=pred.device
     )
+    blur_kernel = blur_kernel / (blur_kernel_size * blur_kernel_size)
 
-    # Return as loss (1 - dice)
-    return 1.0 - dice
+    # Apply blur (convolution with padding to maintain size)
+    def blur_image(img):
+        # img: [B, C, H, W]
+        # Apply blur to each channel separately
+        blurred_channels = []
+        for c in range(img.shape[1]):
+            channel = img[:, c : c + 1, :, :]
+            blurred = F.conv2d(channel, blur_kernel, padding=blur_kernel_size // 2)
+            blurred_channels.append(blurred)
+        blurred = torch.cat(blurred_channels, dim=1)
+        return blurred
+
+    pred_blurred = blur_image(pred)
+    target_blurred = blur_image(target)
+
+    # L1 loss on blurred maps
+    thickness_loss = F.l1_loss(pred_blurred, target_blurred)
+
+    return thickness_loss
 
 
 def save_validation_samples(samples, epoch, device):
@@ -225,50 +279,52 @@ def save_validation_samples(samples, epoch, device):
     print(f"  -> Saved validation sample to {output_path}")
 
 
-def combined_loss(pred, target):
+def combined_loss(pred, target, return_components=False):
     """
     Structure-aware loss function that heavily penalizes missing lines.
 
-    PROBLEM WITH OLD LOSS (L1 + SSIM):
-    - L1 treats all pixels equally: missing a line pixel (sparse) has same weight
-      as being off by a small amount in background (dense). Result: model learns
-      to minimize average error by producing faint, partial lines rather than
-      complete crisp lines.
-    - SSIM measures structural similarity but doesn't specifically penalize
-      missing structural elements (lines).
+    WHY PIXEL LOSS ALONE IS INSUFFICIENT:
+    - Line drawings are SPARSE: ~1-5% of pixels are lines, 95-99% are white background
+    - Pixel-wise losses (L1/MSE) compute average error across ALL pixels
+    - Missing a line pixel contributes minimally to average (1 pixel out of 512*512)
+    - Model can "cheat" by predicting mostly white with faint lines, achieving low pixel loss
+    - Result: model learns to minimize average error, not maximize line presence
 
-    NEW LOSS COMPONENTS:
-    1. L1 (alpha=0.2): Baseline pixel-wise loss, but weighted low since it
-       doesn't capture structure well.
-    2. Edge loss (beta=0.4): Computes loss on edge maps. Missing structural lines
-       (which are edges) are heavily penalized. This is the KEY fix.
-    3. BCE loss (gamma=0.3): Binary cross-entropy treats this as binary classification
-       (line vs background). Heavily penalizes false negatives (missing lines).
-    4. Dice loss (delta=0.1): Measures overlap, penalizes missing coverage.
+    HOW NEW LOSSES ADDRESS THIS:
+    1. Pixel Loss (0.2): Downweighted stabilizer - prevents extreme outputs but not main driver
+    2. Edge Loss (0.4): Computes loss on edge maps - missing structural lines (edges) heavily penalized
+    3. Line Presence Loss (0.3): Binary mask loss - directly penalizes missing line pixels
+    4. Thickness Loss (0.1): Blurred map loss - encourages stable, consistent line thickness
 
-    The high weight on edge_loss ensures missing lines cause large gradient signals.
+    The combination ensures missing lines cause large gradient signals, forcing complete output.
     """
-    # Alpha: L1 loss (low weight - doesn't capture structure)
-    l1_loss = F.l1_loss(pred, target)
+    # Component 1: Pixel loss (downweighted - stabilizer only)
+    pixel_loss = F.l1_loss(pred, target)
 
-    # Beta: Edge-aware loss (HIGH weight - this is the key fix)
+    # Component 2: Edge-aware loss (high weight - correct geometry/contour placement)
     edge_loss = compute_edge_loss(pred, target)
 
-    # Gamma: Binary Cross Entropy (treats as binary classification)
-    # BCE heavily penalizes false negatives (missing lines)
-    bce_loss = F.binary_cross_entropy(pred, target)
+    # Component 3: Line presence loss (high weight - strongly punishes missing strokes)
+    line_presence_loss = compute_line_presence_loss(pred, target)
 
-    # Delta: Dice loss (measures line coverage)
-    dice = dice_loss(pred, target)
+    # Component 4: Thickness consistency loss (low weight - discourages ultra-thin/broken lines)
+    thickness_loss = compute_thickness_consistency_loss(pred, target)
 
-    # Combined loss with weights that prioritize structure
+    # Combined loss with specified weights
     total_loss = (
-        0.2 * l1_loss  # alpha: baseline pixel loss
-        + 0.4 * edge_loss  # beta: edge-aware (CRITICAL for missing lines)
-        + 0.3 * bce_loss  # gamma: binary classification loss
-        + 0.1 * dice  # delta: coverage loss
+        LOSS_WEIGHT_PIXEL * pixel_loss
+        + LOSS_WEIGHT_EDGE * edge_loss
+        + LOSS_WEIGHT_LINE_PRESENCE * line_presence_loss
+        + LOSS_WEIGHT_THICKNESS * thickness_loss
     )
 
+    if return_components:
+        return total_loss, {
+            "pixel": pixel_loss.item(),
+            "edge": edge_loss.item(),
+            "line_presence": line_presence_loss.item(),
+            "thickness": thickness_loss.item(),
+        }
     return total_loss
 
 
@@ -437,6 +493,9 @@ def main():
 
     # Training loop
     best_val_loss = float("inf")
+    best_composite_metric = float(
+        "inf"
+    )  # For model selection based on structural quality
     patience_counter = 0
 
     print(f"\nStarting training for {NUM_EPOCHS} epochs...")
@@ -455,7 +514,7 @@ def main():
             # Forward pass
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = combined_loss(outputs, targets)
+            loss = combined_loss(outputs, targets)  # Training: don't need components
 
             # Backward pass
             loss.backward()
@@ -476,6 +535,10 @@ def main():
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_pixel_loss = 0.0
+        val_edge_loss = 0.0
+        val_line_presence_loss = 0.0
+        val_thickness_loss = 0.0
         val_coverage = 0.0
         num_val_batches = 0
         val_samples_to_save = []  # Store samples for visual debugging
@@ -486,9 +549,15 @@ def main():
                 targets = targets.to(device)
 
                 outputs = model(inputs)
-                loss = combined_loss(outputs, targets)
+                loss, loss_components = combined_loss(
+                    outputs, targets, return_components=True
+                )
 
                 val_loss += loss.item()
+                val_pixel_loss += loss_components["pixel"]
+                val_edge_loss += loss_components["edge"]
+                val_line_presence_loss += loss_components["line_presence"]
+                val_thickness_loss += loss_components["thickness"]
 
                 # Compute line coverage metric
                 batch_coverage = 0.0
@@ -505,9 +574,24 @@ def main():
                     val_samples_to_save = (inputs.cpu(), targets.cpu(), outputs.cpu())
 
         avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0.0
+        avg_val_pixel_loss = (
+            val_pixel_loss / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_edge_loss = (
+            val_edge_loss / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_line_presence_loss = (
+            val_line_presence_loss / num_val_batches if num_val_batches > 0 else 0.0
+        )
+        avg_val_thickness_loss = (
+            val_thickness_loss / num_val_batches if num_val_batches > 0 else 0.0
+        )
         avg_val_coverage = (
             val_coverage / num_val_batches if num_val_batches > 0 else 0.0
         )
+
+        # Composite metric for model selection: edge + line_presence (structural quality)
+        composite_metric = avg_val_edge_loss + avg_val_line_presence_loss
 
         # Visual debug output: save side-by-side comparison
         if val_samples_to_save and epoch % 5 == 0:
@@ -520,45 +604,60 @@ def main():
         if new_lr < old_lr:
             print(f"  -> Learning rate reduced: {old_lr:.2e} -> {new_lr:.2e}")
 
-        # Print epoch summary
+        # Print epoch summary with individual loss components
         print(
-            f"Epoch {epoch + 1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Val Coverage: {avg_val_coverage:.3f}"
+            f"Epoch {epoch + 1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+        )
+        print(
+            f"  Val Components - Pixel: {avg_val_pixel_loss:.6f}, Edge: {avg_val_edge_loss:.6f}, "
+            f"LinePresence: {avg_val_line_presence_loss:.6f}, Thickness: {avg_val_thickness_loss:.6f}"
+        )
+        print(
+            f"  Val Coverage: {avg_val_coverage:.3f}, Composite Metric: {composite_metric:.6f}"
         )
 
         # Explain loss values
         if epoch == 0:
+            print("  NOTE: Pixel loss may plateau around 0.07-0.10 - this is EXPECTED.")
             print(
-                "  NOTE: Pixel loss (L1) may plateau around 0.07-0.10 - this is EXPECTED."
+                "  Line drawings are sparse (~1-5% lines), so pixel loss doesn't capture structure."
             )
             print(
-                "  The model minimizes average pixel error, but line drawings are sparse."
+                "  Watch 'Val Coverage' (target: >0.7) and 'Composite Metric' (edge + line_presence)."
             )
             print(
-                "  Watch 'Val Coverage' metric - it measures if lines are complete (target: >0.7)."
-            )
-            print(
-                "  Edge-aware loss ensures missing structural lines are heavily penalized."
+                "  Best model is selected based on composite metric, not pixel loss alone."
             )
 
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        # Save best model based on composite metric (edge + line_presence)
+        # This ensures we select models with better structural output, not just low pixel loss
+        if composite_metric < best_composite_metric:
+            best_composite_metric = composite_metric
+            best_val_loss = avg_val_loss  # Track for logging
             patience_counter = 0
             torch.save(model.state_dict(), "best_model.pth")
-            print(f"  -> Saved best model (val loss: {avg_val_loss:.6f})")
+            print(
+                f"  -> Saved best model (composite: {composite_metric:.6f}, val loss: {avg_val_loss:.6f})"
+            )
         else:
             patience_counter += 1
 
         # Early stopping (unless disabled)
         if not args.no_stop and patience_counter >= EARLY_STOPPING_PATIENCE:
             print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-            print(f"Best validation loss: {best_val_loss:.6f}")
+            print(
+                f"Best composite metric: {best_composite_metric:.6f} (val loss: {best_val_loss:.6f})"
+            )
             break
 
     # Save final model
     torch.save(model.state_dict(), "final_model.pth")
-    print(f"\nTraining complete! Final validation loss: {avg_val_loss:.6f}")
-    print(f"Best model saved to: best_model.pth")
+    print(
+        f"\nTraining complete! Final composite metric: {composite_metric:.6f}, Val loss: {avg_val_loss:.6f}"
+    )
+    print(
+        f"Best model (composite: {best_composite_metric:.6f}) saved to: best_model.pth"
+    )
     print(f"Final model saved to: final_model.pth")
 
 
