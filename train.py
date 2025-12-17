@@ -1,5 +1,6 @@
 import os
 import random
+import argparse
 from pathlib import Path
 import numpy as np
 import torch
@@ -170,6 +171,17 @@ def setup_lora(unet):
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Train image-to-image model for line drawings"
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test mode: train on only 10 images to check for overfitting",
+    )
+    args = parser.parse_args()
+
     # Explicitly check for CUDA availability
     if torch.cuda.is_available():
         print(f"CUDA available! Using GPU: {torch.cuda.get_device_name(0)}")
@@ -195,21 +207,42 @@ def main():
         "dataset/originals", "dataset/line_drawings", size=IMAGE_SIZE
     )
 
-    # Split: use 10 images for validation, rest for training
-    total_size = len(full_dataset)
-    val_size = min(10, total_size)
-    train_size = total_size - val_size
+    if args.test:
+        # Test mode: use only 10 images total (8 train, 2 val)
+        print("TEST MODE: Training on 10 images to check for overfitting")
+        total_size = min(10, len(full_dataset))
+        val_size = 2
+        train_size = total_size - val_size
 
-    # Create train and validation datasets
-    train_indices = list(range(train_size))
-    val_indices = list(range(train_size, total_size))
+        # Use first N images for test
+        train_indices = list(range(train_size))
+        val_indices = list(range(train_size, total_size))
 
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
-    print(
-        f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}"
-    )
+        print(
+            f"TEST MODE - Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}"
+        )
+        print(
+            "  (If model overfits, train loss should drop to < 0.01 while val loss stays reasonable)"
+        )
+    else:
+        # Normal mode: use 10 images for validation, rest for training
+        total_size = len(full_dataset)
+        val_size = min(10, total_size)
+        train_size = total_size - val_size
+
+        # Create train and validation datasets
+        train_indices = list(range(train_size))
+        val_indices = list(range(train_size, total_size))
+
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+
+        print(
+            f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}"
+        )
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
