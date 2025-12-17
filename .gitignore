@@ -78,3 +78,7 @@ lora_weights/
 *.pth
 best_model.pth
 final_model.pth
+
+# Training outputs
+outputs/
+test_training_images/

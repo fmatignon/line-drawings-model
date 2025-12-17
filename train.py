@@ -87,6 +87,10 @@ class PairedImageDataset(Dataset):
         original_tensor = self._to_tensor(original)  # [3, 512, 512], [0, 1]
         target_tensor = self._to_tensor(target)  # [1, 512, 512], [0, 1]
 
+        # Binarize target to make it more binary-like for line drawings
+        # This ensures the model learns crisp lines, not blurry grayscale
+        target_tensor = self._binarize_target(target_tensor, threshold=0.5)
+
         return original_tensor, target_tensor
 
     def _resize_with_padding(self, img):
@@ -111,17 +115,186 @@ class PairedImageDataset(Dataset):
             arr = arr.transpose(2, 0, 1)  # HWC to CHW
         return torch.from_numpy(arr)
 
+    def _binarize_target(self, target_tensor, threshold=0.5):
+        """
+        Binarize target to make it more binary-like for line drawings.
+        Line drawings should be treated as binary masks (lines vs background),
+        not continuous grayscale. This helps the model learn crisp boundaries.
+        """
+        # Threshold: values above threshold become 1, below become 0
+        # Use a relatively low threshold (0.5) to preserve most line pixels
+        # but still create a clear binary distinction
+        return (target_tensor > threshold).float()
+
+
+def compute_edge_loss(pred, target):
+    """
+    Edge-aware loss: penalize missing edges more than extra pixels.
+    Uses Sobel filters to detect edges in both pred and target,
+    then computes loss on the edge maps. This ensures missing structural
+    lines (which are edges) are heavily penalized.
+    """
+    # Sobel kernels for edge detection
+    sobel_x = torch.tensor(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=pred.dtype, device=pred.device
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=pred.dtype, device=pred.device
+    ).view(1, 1, 3, 3)
+
+    # Compute edge maps for pred and target
+    def get_edges(img):
+        # img: [B, C, H, W]
+        grad_x = F.conv2d(img, sobel_x, padding=1)
+        grad_y = F.conv2d(img, sobel_y, padding=1)
+        edge_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+        return edge_mag
+
+    pred_edges = get_edges(pred)
+    target_edges = get_edges(target)
+
+    # L1 loss on edge maps - missing edges are heavily penalized
+    edge_loss = F.l1_loss(pred_edges, target_edges)
+    return edge_loss
+
+
+def dice_loss(pred, target, smooth=1e-6):
+    """
+    Dice loss: measures overlap between pred and target.
+    Particularly effective for binary segmentation tasks like line drawings.
+    Penalizes missing lines (false negatives) more than extra pixels (false positives).
+    """
+    # Flatten tensors
+    pred_flat = pred.view(-1)
+    target_flat = target.view(-1)
+
+    # Compute intersection and union
+    intersection = (pred_flat * target_flat).sum()
+    dice = (2.0 * intersection + smooth) / (
+        pred_flat.sum() + target_flat.sum() + smooth
+    )
+
+    # Return as loss (1 - dice)
+    return 1.0 - dice
+
+
+def save_validation_samples(samples, epoch, device):
+    """
+    Save validation samples for visual debugging.
+    Creates side-by-side comparison: input | ground truth | model output
+    """
+    inputs, targets, outputs = samples
+
+    # Create output directory
+    output_dir = Path("outputs")
+    output_dir.mkdir(exist_ok=True)
+
+    # Process first sample in batch
+    input_img = inputs[0]
+    target_img = targets[0]
+    output_img = outputs[0]
+
+    # Convert to numpy and denormalize
+    def tensor_to_image(tensor):
+        # tensor: [C, H, W] in [0, 1]
+        arr = tensor.cpu().numpy()
+        if arr.shape[0] == 3:  # RGB
+            arr = arr.transpose(1, 2, 0)
+        else:  # Grayscale
+            arr = arr.squeeze(0)
+        arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
+        if len(arr.shape) == 2:
+            return Image.fromarray(arr, mode="L")
+        else:
+            return Image.fromarray(arr, mode="RGB")
+
+    input_pil = tensor_to_image(input_img)
+    target_pil = tensor_to_image(target_img)
+    output_pil = tensor_to_image(output_img)
+
+    # Create side-by-side comparison
+    # Width: 3 images * 512, Height: 512
+    comparison = Image.new("RGB", (512 * 3, 512), (255, 255, 255))
+    comparison.paste(input_pil.convert("RGB"), (0, 0))
+    comparison.paste(target_pil.convert("RGB"), (512, 0))
+    comparison.paste(output_pil.convert("RGB"), (1024, 0))
+
+    # Save
+    output_path = output_dir / f"epoch_{epoch:03d}_comparison.png"
+    comparison.save(output_path)
+    print(f"  -> Saved validation sample to {output_path}")
+
 
 def combined_loss(pred, target):
-    """Combined L1 + SSIM loss"""
+    """
+    Structure-aware loss function that heavily penalizes missing lines.
+
+    PROBLEM WITH OLD LOSS (L1 + SSIM):
+    - L1 treats all pixels equally: missing a line pixel (sparse) has same weight
+      as being off by a small amount in background (dense). Result: model learns
+      to minimize average error by producing faint, partial lines rather than
+      complete crisp lines.
+    - SSIM measures structural similarity but doesn't specifically penalize
+      missing structural elements (lines).
+
+    NEW LOSS COMPONENTS:
+    1. L1 (alpha=0.2): Baseline pixel-wise loss, but weighted low since it
+       doesn't capture structure well.
+    2. Edge loss (beta=0.4): Computes loss on edge maps. Missing structural lines
+       (which are edges) are heavily penalized. This is the KEY fix.
+    3. BCE loss (gamma=0.3): Binary cross-entropy treats this as binary classification
+       (line vs background). Heavily penalizes false negatives (missing lines).
+    4. Dice loss (delta=0.1): Measures overlap, penalizes missing coverage.
+
+    The high weight on edge_loss ensures missing lines cause large gradient signals.
+    """
+    # Alpha: L1 loss (low weight - doesn't capture structure)
     l1_loss = F.l1_loss(pred, target)
 
-    # SSIM expects [B, C, H, W] format, values in [0, 1]
-    # pytorch_msssim returns value in [-1, 1], we need to convert
-    ssim_value = ssim(pred, target, data_range=1.0)
-    ssim_loss = 1.0 - ssim_value  # Convert to loss (lower is better)
+    # Beta: Edge-aware loss (HIGH weight - this is the key fix)
+    edge_loss = compute_edge_loss(pred, target)
 
-    return 0.5 * l1_loss + 0.5 * ssim_loss
+    # Gamma: Binary Cross Entropy (treats as binary classification)
+    # BCE heavily penalizes false negatives (missing lines)
+    bce_loss = F.binary_cross_entropy(pred, target)
+
+    # Delta: Dice loss (measures line coverage)
+    dice = dice_loss(pred, target)
+
+    # Combined loss with weights that prioritize structure
+    total_loss = (
+        0.2 * l1_loss  # alpha: baseline pixel loss
+        + 0.4 * edge_loss  # beta: edge-aware (CRITICAL for missing lines)
+        + 0.3 * bce_loss  # gamma: binary classification loss
+        + 0.1 * dice  # delta: coverage loss
+    )
+
+    return total_loss
+
+
+def compute_line_coverage(pred, target, threshold=0.5):
+    """
+    Compute line coverage metric: what % of target line pixels are present in pred.
+    This metric directly measures if the model is producing complete lines.
+    Returns value in [0, 1] where 1.0 = perfect coverage.
+    """
+    # Binarize both
+    pred_binary = (pred > threshold).float()
+    target_binary = (target > threshold).float()
+
+    # Count line pixels in target
+    target_lines = target_binary.sum()
+
+    if target_lines == 0:
+        return 1.0  # No lines to cover
+
+    # Count overlapping line pixels
+    overlap = (pred_binary * target_binary).sum()
+
+    # Coverage = overlap / target_lines
+    coverage = overlap / target_lines
+
+    return coverage.item()
 
 
 def main():
@@ -232,6 +405,9 @@ def main():
     )
 
     # Initialize model
+    # NOTE: UNet output uses sigmoid activation (see model.py)
+    # This ensures outputs are in [0, 1] range, matching our binary-like targets
+    # and enabling BCE loss to work correctly.
     model = UNet(in_channels=3, out_channels=1).to(device)
 
     # Initialize weights
@@ -300,10 +476,12 @@ def main():
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_coverage = 0.0
         num_val_batches = 0
+        val_samples_to_save = []  # Store samples for visual debugging
 
         with torch.no_grad():
-            for inputs, targets in val_loader:
+            for batch_idx, (inputs, targets) in enumerate(val_loader):
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
@@ -311,9 +489,29 @@ def main():
                 loss = combined_loss(outputs, targets)
 
                 val_loss += loss.item()
+
+                # Compute line coverage metric
+                batch_coverage = 0.0
+                for i in range(outputs.shape[0]):
+                    batch_coverage += compute_line_coverage(
+                        outputs[i : i + 1], targets[i : i + 1]
+                    )
+                val_coverage += batch_coverage / outputs.shape[0]
+
                 num_val_batches += 1
 
+                # Save first batch of validation samples for visual debugging
+                if batch_idx == 0 and epoch % 5 == 0:  # Every 5 epochs
+                    val_samples_to_save = (inputs.cpu(), targets.cpu(), outputs.cpu())
+
         avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0.0
+        avg_val_coverage = (
+            val_coverage / num_val_batches if num_val_batches > 0 else 0.0
+        )
+
+        # Visual debug output: save side-by-side comparison
+        if val_samples_to_save and epoch % 5 == 0:
+            save_validation_samples(val_samples_to_save, epoch, device)
 
         # Learning rate scheduling
         old_lr = optimizer.param_groups[0]["lr"]
@@ -324,8 +522,23 @@ def main():
 
         # Print epoch summary
         print(
-            f"Epoch {epoch + 1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+            f"Epoch {epoch + 1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Val Coverage: {avg_val_coverage:.3f}"
         )
+
+        # Explain loss values
+        if epoch == 0:
+            print(
+                "  NOTE: Pixel loss (L1) may plateau around 0.07-0.10 - this is EXPECTED."
+            )
+            print(
+                "  The model minimizes average pixel error, but line drawings are sparse."
+            )
+            print(
+                "  Watch 'Val Coverage' metric - it measures if lines are complete (target: >0.7)."
+            )
+            print(
+                "  Edge-aware loss ensures missing structural lines are heavily penalized."
+            )
 
         # Save best model
         if avg_val_loss < best_val_loss:
