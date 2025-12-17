@@ -1,4 +1,7 @@
 import os
+import cv2
+import numpy as np
+import torch
 from data.base_dataset import BaseDataset, get_params, get_transform
 from data.image_folder import make_dataset
 from PIL import Image
@@ -31,7 +34,7 @@ class AlignedDataset(BaseDataset):
             index - - a random integer for data indexing
 
         Returns a dictionary that contains A, B, A_paths and B_paths
-            A (tensor) - - an image in the input domain
+            A (tensor) - - an image in the input domain (with Canny edge as 4th channel)
             B (tensor) - - its corresponding image in the target domain
             A_paths (str) - - image paths
             B_paths (str) - - image paths (same as A_paths)
@@ -45,13 +48,26 @@ class AlignedDataset(BaseDataset):
         A = AB.crop((0, 0, w2, h))
         B = AB.crop((w2, 0, w, h))
 
-        # apply the same transform to both A and B
-        transform_params = get_params(self.opt, A.size)
-        A_transform = get_transform(self.opt, transform_params, grayscale=(self.input_nc == 1))
-        B_transform = get_transform(self.opt, transform_params, grayscale=(self.output_nc == 1))
+        # Compute Canny edges from A (before transforms for better edge detection)
+        A_np = np.array(A)
+        A_gray = cv2.cvtColor(A_np, cv2.COLOR_RGB2GRAY)
+        # Canny edge detection with thresholds
+        canny_edges = cv2.Canny(A_gray, threshold1=50, threshold2=150)
+        # Normalize to [0, 1] and convert to PIL Image
+        canny_edges = Image.fromarray(canny_edges).convert("L")
 
-        A = A_transform(A)
+        # apply the same transform to both A, B, and Canny edges
+        transform_params = get_params(self.opt, A.size)
+        A_transform = get_transform(self.opt, transform_params, grayscale=False)  # Keep RGB
+        B_transform = get_transform(self.opt, transform_params, grayscale=(self.output_nc == 1))
+        canny_transform = get_transform(self.opt, transform_params, grayscale=True)  # Canny is grayscale
+
+        A = A_transform(A)  # [3, H, W] in range [-1, 1]
         B = B_transform(B)
+        canny = canny_transform(canny_edges)  # [1, H, W] in range [-1, 1]
+
+        # Concatenate A (3 channels) with Canny (1 channel) to get 4 channels
+        A = torch.cat([A, canny], dim=0)  # [4, H, W]
 
         return {"A": A, "B": B, "A_paths": AB_path, "B_paths": AB_path}
 
