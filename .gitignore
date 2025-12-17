@@ -71,3 +71,5 @@ logs/
 *.log
 
 *.ai
+
+lora_weights/

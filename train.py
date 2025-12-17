@@ -203,24 +203,36 @@ def main():
             originals = originals.to(device)
             targets = targets.to(device)
 
-            # Encode target images to latent space using VAE
+            # Encode both original and target images to latent space using VAE
             with torch.no_grad():
                 # VAE expects input in [-1, 1] range, which we already have
                 # Convert to VAE's dtype (fp16 if using mixed precision)
                 vae_dtype = next(pipe.vae.parameters()).dtype
+                originals_encoded = originals.to(dtype=vae_dtype)
                 targets_encoded = targets.to(dtype=vae_dtype)
+
+                # Encode original (input) and target (output) images
+                original_latents = pipe.vae.encode(
+                    originals_encoded
+                ).latent_dist.sample()
+                original_latents = original_latents * pipe.vae.config.scaling_factor
+
                 target_latents = pipe.vae.encode(targets_encoded).latent_dist.sample()
                 target_latents = target_latents * pipe.vae.config.scaling_factor
 
-            # Standard SD training: add noise to target and predict noise
-            noise = torch.randn_like(target_latents)
+            # For img2img training: start from original latents with noise, learn to transform to target
+            # Use random strength (0.5-1.0) to vary transformation amount
+            strength = 0.5 + 0.5 * torch.rand(1, device=device).item()
+            noise = torch.randn_like(original_latents)
             timesteps = torch.randint(
                 0,
-                pipe.scheduler.config.num_train_timesteps,
-                (target_latents.shape[0],),
+                int(pipe.scheduler.config.num_train_timesteps * strength),
+                (original_latents.shape[0],),
                 device=device,
             )
-            noisy_latents = pipe.scheduler.add_noise(target_latents, noise, timesteps)
+
+            # Start from original image latents with noise (this simulates img2img input)
+            noisy_latents = pipe.scheduler.add_noise(original_latents, noise, timesteps)
 
             # Dummy prompt for text conditioning (required by SD architecture)
             prompt = ""
@@ -242,10 +254,20 @@ def main():
                 encoder_hidden_states=text_embeddings,
             ).sample
 
-            # Predict noise (SD training objective)
+            # Predict noise that transforms original → target
+            # The model should learn: given noisy_original, predict noise to get target
             if pipe.scheduler.config.prediction_type == "epsilon":
-                target = noise
+                # Calculate target noise: what noise bridges noisy_original → target
+                # Using the scheduler's reverse process: target_noise = (noisy - target * alpha) / sigma
+                alphas_cumprod = pipe.scheduler.alphas_cumprod[timesteps].view(
+                    -1, 1, 1, 1
+                )
+                target_noise = (
+                    noisy_latents - target_latents * alphas_cumprod.sqrt()
+                ) / (1 - alphas_cumprod).sqrt()
+                target = target_noise
             elif pipe.scheduler.config.prediction_type == "v_prediction":
+                # For v-prediction, calculate velocity that transforms original → target
                 target = pipe.scheduler.get_velocity(target_latents, noise, timesteps)
             else:
                 raise ValueError(
@@ -286,23 +308,30 @@ def main():
                 originals = originals.to(device)
                 targets = targets.to(device)
 
-                # Encode target images to latent space using VAE
-                # Convert to VAE's dtype (fp16 if using mixed precision)
+                # Encode both original and target images to latent space using VAE
                 vae_dtype = next(pipe.vae.parameters()).dtype
+                originals_encoded = originals.to(dtype=vae_dtype)
                 targets_encoded = targets.to(dtype=vae_dtype)
+
+                original_latents = pipe.vae.encode(
+                    originals_encoded
+                ).latent_dist.sample()
+                original_latents = original_latents * pipe.vae.config.scaling_factor
+
                 target_latents = pipe.vae.encode(targets_encoded).latent_dist.sample()
                 target_latents = target_latents * pipe.vae.config.scaling_factor
 
-                # Standard SD training: add noise to target and predict noise
-                noise = torch.randn_like(target_latents)
+                # For img2img validation: start from original with noise, denoise towards target
+                strength = 0.7  # Fixed strength for validation
+                noise = torch.randn_like(original_latents)
                 timesteps = torch.randint(
                     0,
-                    pipe.scheduler.config.num_train_timesteps,
-                    (target_latents.shape[0],),
+                    int(pipe.scheduler.config.num_train_timesteps * strength),
+                    (original_latents.shape[0],),
                     device=device,
                 )
                 noisy_latents = pipe.scheduler.add_noise(
-                    target_latents, noise, timesteps
+                    original_latents, noise, timesteps
                 )
 
                 # Dummy prompt for text conditioning
@@ -325,9 +354,15 @@ def main():
                     encoder_hidden_states=text_embeddings,
                 ).sample
 
-                # Predict noise (SD training objective)
+                # Predict noise that transforms original → target (same as training)
                 if pipe.scheduler.config.prediction_type == "epsilon":
-                    target = noise
+                    alphas_cumprod = pipe.scheduler.alphas_cumprod[timesteps].view(
+                        -1, 1, 1, 1
+                    )
+                    target_noise = (
+                        noisy_latents - target_latents * alphas_cumprod.sqrt()
+                    ) / (1 - alphas_cumprod).sqrt()
+                    target = target_noise
                 elif pipe.scheduler.config.prediction_type == "v_prediction":
                     target = pipe.scheduler.get_velocity(
                         target_latents, noise, timesteps
