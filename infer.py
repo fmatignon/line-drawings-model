@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-# Import model architecture from train.py
-from train import UNet, detect_edges
+# Import model architecture and edge detection from model.py
+from model import UNet, detect_edges
 
 IMAGE_SIZE = 512
 
