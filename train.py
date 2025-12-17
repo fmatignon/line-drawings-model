@@ -346,7 +346,7 @@ def main():
         model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=1e-5
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, verbose=True
+        optimizer, mode="min", factor=0.5, patience=5
     )
 
     # Training loop
@@ -406,7 +406,11 @@ def main():
         avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0.0
 
         # Learning rate scheduling
+        old_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(avg_val_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < old_lr:
+            print(f"  -> Learning rate reduced: {old_lr:.2e} -> {new_lr:.2e}")
 
         # Print epoch summary
         print(
