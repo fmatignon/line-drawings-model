@@ -3,6 +3,7 @@ import random
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from diffusers import StableDiffusionImg2ImgPipeline
@@ -48,6 +49,9 @@ class PairedImageDataset(Dataset):
         original = self._resize_with_padding(original)
         target = self._resize_with_padding(target)
 
+        # Convert original to edge-detected image (runtime preprocessing)
+        original = self._detect_edges(original)
+
         # Random horizontal flip for augmentation
         if random.random() > 0.5:
             original = original.transpose(Image.FLIP_LEFT_RIGHT)
@@ -68,12 +72,85 @@ class PairedImageDataset(Dataset):
         new_img.paste(img, (paste_x, paste_y))
         return new_img
 
+    def _detect_edges(self, img):
+        """Convert image to edge-detected version using Sobel filters"""
+        # Convert PIL to numpy array
+        arr = np.array(img).astype(np.float32) / 255.0
+
+        # Convert to grayscale if RGB
+        if len(arr.shape) == 3:
+            gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        else:
+            gray = arr
+
+        # Sobel kernels for edge detection
+        sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+
+        # Apply Sobel filters using numpy vectorized operations
+        def convolve2d(image, kernel):
+            """Fast 2D convolution using numpy"""
+            h, w = image.shape
+            kh, kw = kernel.shape
+            pad_h, pad_w = kh // 2, kw // 2
+            padded = np.pad(image, ((pad_h, pad_h), (pad_w, pad_w)), mode="edge")
+
+            # Use numpy's sliding window view for efficient convolution
+            from numpy.lib.stride_tricks import sliding_window_view
+
+            windows = sliding_window_view(padded, (kh, kw))
+            result = np.sum(windows * kernel, axis=(2, 3))
+            return result
+
+        grad_x = convolve2d(gray, sobel_x)
+        grad_y = convolve2d(gray, sobel_y)
+
+        # Compute edge magnitude
+        edge_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+
+        # Normalize to [0, 1] and invert (edges are white on black background)
+        edge_magnitude = np.clip(edge_magnitude, 0, 1)
+        edge_magnitude = 1.0 - edge_magnitude  # Invert: black edges on white background
+
+        # Convert back to RGB (3 channels)
+        edge_rgb = np.stack([edge_magnitude, edge_magnitude, edge_magnitude], axis=2)
+
+        return Image.fromarray((edge_rgb * 255).astype(np.uint8))
+
     def _to_tensor(self, img):
         """Convert PIL image to tensor normalized to [-1, 1]"""
         arr = np.array(img).astype(np.float32) / 255.0
         arr = arr * 2.0 - 1.0  # Normalize to [-1, 1]
         arr = arr.transpose(2, 0, 1)  # HWC to CHW
         return torch.from_numpy(arr)
+
+
+def modify_unet_for_img2img(unet):
+    """Modify UNet to accept 8 channels (4 for original + 4 for noisy target)"""
+    # Get original conv_in layer properties
+    in_channels = 8  # 4 (original) + 4 (noisy target)
+    out_channels = unet.conv_in.out_channels
+    kernel_size = unet.conv_in.kernel_size
+    stride = unet.conv_in.stride
+    padding = unet.conv_in.padding
+
+    # Update config
+    unet.register_to_config(in_channels=in_channels)
+
+    # Create new conv_in layer with 8 input channels
+    with torch.no_grad():
+        new_conv_in = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        # Initialize new channels to zero, copy original weights to first 4 channels
+        new_conv_in.weight.zero_()
+        new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
+        if unet.conv_in.bias is not None:
+            new_conv_in.bias = nn.Parameter(unet.conv_in.bias.clone())
+        else:
+            new_conv_in.bias = None
+
+    # Replace the layer
+    unet.conv_in = new_conv_in
+    return unet
 
 
 def setup_lora(unet):
@@ -151,6 +228,10 @@ def main():
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
 
+    # Modify UNet to accept 8 channels (original + noisy target) for img2img conditioning
+    print("Modifying UNet for img2img conditioning (8 channels)...")
+    pipe.unet = modify_unet_for_img2img(pipe.unet)
+
     # Setup LoRA in fp32 first
     print("Setting up LoRA adapters...")
     setup_lora(pipe.unet)
@@ -220,19 +301,28 @@ def main():
                 target_latents = pipe.vae.encode(targets_encoded).latent_dist.sample()
                 target_latents = target_latents * pipe.vae.config.scaling_factor
 
-            # For img2img training: start from original latents with noise, learn to transform to target
-            # Use random strength (0.5-1.0) to vary transformation amount
-            strength = 0.5 + 0.5 * torch.rand(1, device=device).item()
-            noise = torch.randn_like(original_latents)
+            # For img2img training: condition on original, learn to denoise towards target
+            # Strategy: Start from target latents with noise, but condition UNet on original latents
+            # We concatenate original latents with noisy target latents as input (8 channels total)
+
+            # Add noise to target latents (standard diffusion training)
+            noise = torch.randn_like(target_latents)
             timesteps = torch.randint(
                 0,
-                int(pipe.scheduler.config.num_train_timesteps * strength),
-                (original_latents.shape[0],),
+                pipe.scheduler.config.num_train_timesteps,
+                (target_latents.shape[0],),
                 device=device,
             )
+            noisy_target_latents = pipe.scheduler.add_noise(
+                target_latents, noise, timesteps
+            )
 
-            # Start from original image latents with noise (this simulates img2img input)
-            noisy_latents = pipe.scheduler.add_noise(original_latents, noise, timesteps)
+            # Concatenate original latents with noisy target latents to condition on original
+            # This gives UNet both the noisy target (to denoise) and original (as conditioning)
+            # Shape: [B, 8, H, W] = [B, 4 (original) + 4 (noisy_target), H, W]
+            conditioned_latents = torch.cat(
+                [original_latents, noisy_target_latents], dim=1
+            )
 
             # Dummy prompt for text conditioning (required by SD architecture)
             prompt = ""
@@ -247,36 +337,17 @@ def main():
             )
             text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
 
-            # Forward pass through UNet
+            # Forward pass through UNet with conditioned latents
             model_pred = pipe.unet(
-                noisy_latents,
+                conditioned_latents,
                 timesteps,
                 encoder_hidden_states=text_embeddings,
             ).sample
 
-            # Predict noise that transforms original → target
-            # For img2img: we want to predict noise that, when removed from noisy_original, gives target
-            # The target noise is: what noise bridges noisy_original to target_latents
+            # Standard noise prediction target
             if pipe.scheduler.config.prediction_type == "epsilon":
-                # Calculate: if we have noisy_original and want target, what noise should we predict?
-                # Reverse formula: target = (noisy - sqrt(1-alpha) * noise) / sqrt(alpha)
-                # So: noise = (noisy - sqrt(alpha) * target) / sqrt(1-alpha)
-                alphas_cumprod = pipe.scheduler.alphas_cumprod[timesteps]
-                # Handle batched timesteps
-                if len(alphas_cumprod.shape) == 0:
-                    alphas_cumprod = alphas_cumprod.unsqueeze(0)
-                alphas_cumprod = alphas_cumprod.view(-1, 1, 1, 1)
-
-                sqrt_alpha = alphas_cumprod.sqrt()
-                sqrt_one_minus_alpha = (1 - alphas_cumprod).sqrt()
-
-                # Target noise: what noise transforms noisy_original → target
-                target_noise = (
-                    noisy_latents - target_latents * sqrt_alpha
-                ) / sqrt_one_minus_alpha
-                target = target_noise
+                target = noise
             elif pipe.scheduler.config.prediction_type == "v_prediction":
-                # For v-prediction, use velocity
                 target = pipe.scheduler.get_velocity(target_latents, noise, timesteps)
             else:
                 raise ValueError(
@@ -330,17 +401,20 @@ def main():
                 target_latents = pipe.vae.encode(targets_encoded).latent_dist.sample()
                 target_latents = target_latents * pipe.vae.config.scaling_factor
 
-                # For img2img validation: start from original with noise, denoise towards target
-                strength = 0.7  # Fixed strength for validation
-                noise = torch.randn_like(original_latents)
+                # For img2img validation: same approach as training
+                # Add noise to target latents and concatenate with original
+                noise = torch.randn_like(target_latents)
                 timesteps = torch.randint(
                     0,
-                    int(pipe.scheduler.config.num_train_timesteps * strength),
-                    (original_latents.shape[0],),
+                    pipe.scheduler.config.num_train_timesteps,
+                    (target_latents.shape[0],),
                     device=device,
                 )
-                noisy_latents = pipe.scheduler.add_noise(
-                    original_latents, noise, timesteps
+                noisy_target_latents = pipe.scheduler.add_noise(
+                    target_latents, noise, timesteps
+                )
+                conditioned_latents = torch.cat(
+                    [original_latents, noisy_target_latents], dim=1
                 )
 
                 # Dummy prompt for text conditioning
@@ -356,22 +430,16 @@ def main():
                 )
                 text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
 
-                # Forward pass through UNet
+                # Forward pass through UNet with conditioned latents
                 model_pred = pipe.unet(
-                    noisy_latents,
+                    conditioned_latents,
                     timesteps,
                     encoder_hidden_states=text_embeddings,
                 ).sample
 
-                # Predict noise that transforms original → target (same as training)
+                # Standard noise prediction target (same as training)
                 if pipe.scheduler.config.prediction_type == "epsilon":
-                    alphas_cumprod = pipe.scheduler.alphas_cumprod[timesteps].view(
-                        -1, 1, 1, 1
-                    )
-                    target_noise = (
-                        noisy_latents - target_latents * alphas_cumprod.sqrt()
-                    ) / (1 - alphas_cumprod).sqrt()
-                    target = target_noise
+                    target = noise
                 elif pipe.scheduler.config.prediction_type == "v_prediction":
                     target = pipe.scheduler.get_velocity(
                         target_latents, noise, timesteps

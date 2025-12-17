@@ -1,9 +1,11 @@
 import sys
 import torch
+import torch.nn as nn
 from pathlib import Path
 from PIL import Image
 import numpy as np
 from diffusers import StableDiffusionImg2ImgPipeline
+from peft import PeftModel
 
 # Hardcoded hyperparameters
 IMAGE_SIZE = 512
@@ -12,6 +14,52 @@ LORA_WEIGHTS_DIR = "lora_weights"
 STRENGTH = 0.9  # Higher strength for more transformation
 GUIDANCE_SCALE = 7.5  # Higher guidance for better adherence to learned style
 NUM_INFERENCE_STEPS = 50  # More steps for better quality
+
+
+def detect_edges(img):
+    """Convert image to edge-detected version using Sobel filters"""
+    # Convert PIL to numpy array
+    arr = np.array(img).astype(np.float32) / 255.0
+
+    # Convert to grayscale if RGB
+    if len(arr.shape) == 3:
+        gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    else:
+        gray = arr
+
+    # Sobel kernels for edge detection
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+
+    # Apply Sobel filters using numpy vectorized operations
+    def convolve2d(image, kernel):
+        """Fast 2D convolution using numpy"""
+        h, w = image.shape
+        kh, kw = kernel.shape
+        pad_h, pad_w = kh // 2, kw // 2
+        padded = np.pad(image, ((pad_h, pad_h), (pad_w, pad_w)), mode="edge")
+
+        # Use numpy's sliding window view for efficient convolution
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        windows = sliding_window_view(padded, (kh, kw))
+        result = np.sum(windows * kernel, axis=(2, 3))
+        return result
+
+    grad_x = convolve2d(gray, sobel_x)
+    grad_y = convolve2d(gray, sobel_y)
+
+    # Compute edge magnitude
+    edge_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+
+    # Normalize to [0, 1] and invert (edges are white on black background)
+    edge_magnitude = np.clip(edge_magnitude, 0, 1)
+    edge_magnitude = 1.0 - edge_magnitude  # Invert: black edges on white background
+
+    # Convert back to RGB (3 channels)
+    edge_rgb = np.stack([edge_magnitude, edge_magnitude, edge_magnitude], axis=2)
+
+    return Image.fromarray((edge_rgb * 255).astype(np.uint8))
 
 
 def preprocess_image(image_path, size=512):
@@ -24,6 +72,9 @@ def preprocess_image(image_path, size=512):
     paste_x = (size - img.width) // 2
     paste_y = (size - img.height) // 2
     new_img.paste(img, (paste_x, paste_y))
+
+    # Convert to edge-detected image (runtime preprocessing)
+    new_img = detect_edges(new_img)
 
     return new_img
 
@@ -54,6 +105,34 @@ def otsu_threshold(gray):
     # Find threshold with maximum variance
     threshold = np.argmax(between_class_variance)
     return threshold
+
+
+def modify_unet_for_img2img(unet):
+    """Modify UNet to accept 8 channels (4 for original + 4 for noisy target)"""
+    # Get original conv_in layer properties
+    in_channels = 8  # 4 (original) + 4 (noisy target)
+    out_channels = unet.conv_in.out_channels
+    kernel_size = unet.conv_in.kernel_size
+    stride = unet.conv_in.stride
+    padding = unet.conv_in.padding
+
+    # Update config
+    unet.register_to_config(in_channels=in_channels)
+
+    # Create new conv_in layer with 8 input channels
+    with torch.no_grad():
+        new_conv_in = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        # Initialize new channels to zero, copy original weights to first 4 channels
+        new_conv_in.weight.zero_()
+        new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
+        if unet.conv_in.bias is not None:
+            new_conv_in.bias = nn.Parameter(unet.conv_in.bias.clone())
+        else:
+            new_conv_in.bias = None
+
+    # Replace the layer
+    unet.conv_in = new_conv_in
+    return unet
 
 
 def postprocess_to_bw(image_tensor):
@@ -151,52 +230,90 @@ def main():
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL_ID, torch_dtype=dtype)
     pipe = pipe.to(device)
 
-    # Load LoRA weights
-    # Note: During training, the full UNet with PEFT adapter was saved
-    # We need to load it and extract just the LoRA weights, or load the full model
+    # Modify UNet to accept 8 channels (same as training)
+    print("Modifying UNet for img2img conditioning (8 channels)...")
+    pipe.unet = modify_unet_for_img2img(pipe.unet)
+
+    # Load LoRA weights using PEFT
     print("Loading LoRA weights...")
     import os
 
     lora_path = os.path.abspath(LORA_WEIGHTS_DIR)
-    weights_file = os.path.join(lora_path, "diffusion_pytorch_model.safetensors")
 
-    if os.path.exists(weights_file):
-        # Load the safetensors file and extract LoRA weights
-        # The saved model contains the base model + LoRA adapters
-        # We'll load the state dict and filter for LoRA parameters
-        from safetensors.torch import load_file
-
-        state_dict = load_file(weights_file, device=device)
-
-        # Filter to get only LoRA parameters (they have 'lora' in the key)
-        lora_state_dict = {k: v for k, v in state_dict.items() if "lora" in k.lower()}
-
-        if lora_state_dict:
-            # Load only the LoRA weights into the UNet
-            # Need to match the key format (remove any PEFT prefixes)
-            pipe.unet.load_state_dict(lora_state_dict, strict=False)
-            print(f"Loaded {len(lora_state_dict)} LoRA parameter groups")
-        else:
-            # If no LoRA keys found, try loading the full state dict
-            print("No LoRA keys found, loading full model weights...")
-            pipe.unet.load_state_dict(state_dict, strict=False)
-    else:
-        raise FileNotFoundError(f"Weights file not found: {weights_file}")
+    # Load PEFT adapter
+    pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_path, local_files_only=True)
+    print("LoRA weights loaded successfully.")
 
     # Preprocess input image
     print(f"Processing {input_path}...")
     input_image = preprocess_image(input_path, size=IMAGE_SIZE)
 
-    # Run inference
+    # Convert input image to tensor (normalize to [-1, 1])
+    import numpy as np
+
+    arr = np.array(input_image).astype(np.float32) / 255.0
+    arr = arr * 2.0 - 1.0  # Normalize to [-1, 1]
+    arr = arr.transpose(2, 0, 1)  # HWC to CHW
+    input_tensor = torch.from_numpy(arr).unsqueeze(0).to(device).to(dtype)
+
+    # Encode input image to latent space
+    print("Encoding input image...")
+    with torch.no_grad():
+        input_latents = pipe.vae.encode(input_tensor).latent_dist.sample()
+        input_latents = input_latents * pipe.vae.config.scaling_factor
+
+    # Prepare scheduler
+    pipe.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=device)
+    timesteps = pipe.scheduler.timesteps
+
+    # Calculate initial timestep based on strength
+    init_timestep = int(NUM_INFERENCE_STEPS * STRENGTH)
+    t_start = max(NUM_INFERENCE_STEPS - init_timestep, 0)
+    timesteps = timesteps[t_start:]
+
+    # Start from input latents with noise
+    noise = torch.randn_like(input_latents)
+    latents = pipe.scheduler.add_noise(input_latents, noise, timesteps[0:1])
+
+    # Prepare text embeddings (empty prompt)
     print("Running inference...")
-    # Use empty prompt for deterministic output
-    result = pipe(
-        prompt="",
-        image=input_image,
-        strength=STRENGTH,
-        guidance_scale=GUIDANCE_SCALE,
-        num_inference_steps=NUM_INFERENCE_STEPS,
-    ).images[0]
+    prompt = ""
+    text_inputs = pipe.tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_embeddings = pipe.text_encoder(text_inputs.input_ids.to(device))[0]
+
+    # Custom denoising loop with 8-channel conditioning
+    for i, t in enumerate(timesteps):
+        # Concatenate original input latents with current noisy latents
+        conditioned_latents = torch.cat([input_latents, latents], dim=1)
+
+        # Predict noise
+        noise_pred = pipe.unet(
+            conditioned_latents,
+            t,
+            encoder_hidden_states=text_embeddings,
+        ).sample
+
+        # Denoise step
+        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        if (i + 1) % 10 == 0:
+            print(f"  Step {i + 1}/{len(timesteps)}")
+
+    # Decode latents to image
+    print("Decoding result...")
+    with torch.no_grad():
+        latents = 1 / pipe.vae.config.scaling_factor * latents
+        result = pipe.vae.decode(latents).sample
+        result = (result / 2 + 0.5).clamp(0, 1)
+        result = result.cpu().permute(0, 2, 3, 1).numpy()
+        result = (result * 255).astype(np.uint8)
+        result = Image.fromarray(result[0])
 
     # Post-process to clean black and white
     print("Post-processing to black and white...")
