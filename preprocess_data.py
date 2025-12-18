@@ -7,7 +7,7 @@ def resize_with_padding(img, size=512, interpolation=cv2.INTER_AREA):
     """
     Resize image to size x size maintaining aspect ratio with padding.
     Matches the preprocessing used in training.
-    
+
     Args:
         img: Input image (numpy array)
         size: Target size (width and height)

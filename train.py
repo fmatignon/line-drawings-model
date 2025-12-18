@@ -104,20 +104,31 @@ if __name__ == "__main__":
     os.makedirs(results_dir, exist_ok=True)
     print(f"Saving results to: {results_dir}")
     
-    # Load original images from dataset/originals
-    originals_dir = os.path.join(opt.dataroot.replace(opt.phase, "").rstrip("/"), "originals")
+    # Get the list of images that were actually used during training
+    # The dataset contains aligned images (A|B side-by-side), we need to extract the filenames
+    training_image_paths = []
+    for i in range(len(dataset)):
+        data = dataset[i]
+        image_path = data.get("A_paths", None) or data.get("B_paths", None)
+        if image_path:
+            training_image_paths.append(image_path)
+    
+    print(f"Found {len(training_image_paths)} images that were used during training")
+    
+    # Extract base directory paths
+    base_dir = opt.dataroot.replace(opt.phase, "").rstrip("/")
+    if not base_dir:
+        base_dir = os.path.dirname(opt.dataroot.rstrip("/"))
+    
+    originals_dir = os.path.join(base_dir, "originals")
     if not os.path.exists(originals_dir):
         # Try alternative path
         originals_dir = "dataset/originals"
     
-    line_drawings_dir = os.path.join(opt.dataroot.replace(opt.phase, "").rstrip("/"), "line_drawings")
+    line_drawings_dir = os.path.join(base_dir, "line_drawings")
     if not os.path.exists(line_drawings_dir):
         # Try alternative path
         line_drawings_dir = "dataset/line_drawings"
-    
-    # Get list of original images
-    original_files = sorted([f for f in os.listdir(originals_dir) 
-                           if f.lower().endswith((".png", ".jpg", ".jpeg"))])
     
     # Helper function to resize with padding (same as preprocess_data.py)
     def resize_with_padding(img, size=512, interpolation=cv2.INTER_AREA):
@@ -143,17 +154,44 @@ if __name__ == "__main__":
         
         return canvas
     
-    # Process all original images
+    # Process only images that were used during training
     with torch.no_grad():
-        for i, filename in enumerate(original_files):
-            original_path = os.path.join(originals_dir, filename)
-            line_drawing_path = os.path.join(line_drawings_dir, filename)
+        for i, aligned_image_path in enumerate(training_image_paths):
+            # Extract filename from the aligned image path
+            # The aligned images are in dataset/aligned or dataset/train, etc.
+            aligned_filename = os.path.basename(aligned_image_path)
+            name, ext = os.path.splitext(aligned_filename)
+            
+            # Find corresponding original and line drawing files
+            original_path = os.path.join(originals_dir, aligned_filename)
+            line_drawing_path = os.path.join(line_drawings_dir, aligned_filename)
+            
+            # If exact match not found, try without extension variations
+            if not os.path.exists(original_path):
+                # Try to find with different extensions
+                found = False
+                for ext_try in [".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]:
+                    try_path = os.path.join(originals_dir, name + ext_try)
+                    if os.path.exists(try_path):
+                        original_path = try_path
+                        found = True
+                        break
+                if not found:
+                    print(f"Skipping {aligned_filename}: Original image not found in {originals_dir}")
+                    continue
             
             if not os.path.exists(line_drawing_path):
-                print(f"Skipping {filename}: No matching line drawing found.")
-                continue
-            
-            name, ext = os.path.splitext(filename)
+                # Try to find with different extensions
+                found = False
+                for ext_try in [".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]:
+                    try_path = os.path.join(line_drawings_dir, name + ext_try)
+                    if os.path.exists(try_path):
+                        line_drawing_path = try_path
+                        found = True
+                        break
+                if not found:
+                    print(f"Skipping {aligned_filename}: Line drawing not found in {line_drawings_dir}")
+                    continue
             
             # Load and preprocess original image (same as preprocess_data.py)
             img_a = cv2.imread(original_path)
@@ -210,9 +248,9 @@ if __name__ == "__main__":
             combined_pil.save(os.path.join(results_dir, f"{name}_comparison{ext}"))
             
             if (i + 1) % 10 == 0:
-                print(f"Processed {i + 1}/{len(original_files)} images...")
+                print(f"Processed {i + 1}/{len(training_image_paths)} images...")
     
-    print(f"\nCompleted! Processed {len(original_files)} images.")
+    print(f"\nCompleted! Processed {len(training_image_paths)} training images.")
     print(f"Results saved to: {results_dir}")
     print("="*50 + "\n")
 
