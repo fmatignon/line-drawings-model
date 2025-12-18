@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import torch
+import torchvision.transforms as transforms
 from data.base_dataset import BaseDataset, get_params, get_transform
 from data.image_folder import make_dataset
 from PIL import Image
@@ -58,9 +59,17 @@ class AlignedDataset(BaseDataset):
 
         # apply the same transform to both A, B, and Canny edges
         transform_params = get_params(self.opt, A.size)
-        A_transform = get_transform(self.opt, transform_params, grayscale=False)  # Keep RGB
-        B_transform = get_transform(self.opt, transform_params, grayscale=(self.output_nc == 1))
-        canny_transform = get_transform(self.opt, transform_params, grayscale=True)  # Canny is grayscale
+        A_transform = get_transform(self.opt, transform_params, grayscale=False)  # Keep RGB, use BICUBIC for photos
+        # Use NEAREST interpolation for B (line drawings) to avoid anti-aliasing
+        B_transform = get_transform(
+            self.opt, transform_params, grayscale=(self.output_nc == 1),
+            method=transforms.InterpolationMode.NEAREST
+        )
+        # Use NEAREST for Canny edges too (they're binary)
+        canny_transform = get_transform(
+            self.opt, transform_params, grayscale=True,
+            method=transforms.InterpolationMode.NEAREST
+        )
 
         A = A_transform(A)  # [3, H, W] in range [-1, 1]
         B = B_transform(B)

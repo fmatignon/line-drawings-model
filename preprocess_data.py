@@ -3,10 +3,15 @@ import cv2
 import numpy as np
 
 
-def resize_with_padding(img, size=512):
+def resize_with_padding(img, size=512, interpolation=cv2.INTER_AREA):
     """
     Resize image to size x size maintaining aspect ratio with padding.
     Matches the preprocessing used in training.
+    
+    Args:
+        img: Input image (numpy array)
+        size: Target size (width and height)
+        interpolation: OpenCV interpolation method (INTER_AREA for photos, INTER_NEAREST for line drawings)
     """
     h, w = img.shape[:2]
 
@@ -16,7 +21,7 @@ def resize_with_padding(img, size=512):
     new_h = int(h * scale)
 
     # Resize maintaining aspect ratio
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=interpolation)
 
     # Create square canvas with black padding
     if len(img.shape) == 3:
@@ -67,8 +72,9 @@ def align_images(photo_dir, drawing_dir, output_dir, size=512):
             continue
 
         # Resize maintaining aspect ratio with padding (matches training preprocessing)
-        img_a = resize_with_padding(img_a, size)
-        img_b = resize_with_padding(img_b, size)
+        # Use INTER_AREA for photos (A), INTER_NEAREST for line drawings (B) to avoid anti-aliasing
+        img_a = resize_with_padding(img_a, size, interpolation=cv2.INTER_AREA)
+        img_b = resize_with_padding(img_b, size, interpolation=cv2.INTER_NEAREST)
 
         # Combine side-by-side (A is Photo, B is Drawing)
         combined = np.concatenate([img_a, img_b], axis=1)
