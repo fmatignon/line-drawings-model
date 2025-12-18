@@ -20,11 +20,14 @@ See frequently asked questions at: https://github.com/junyanz/pytorch-CycleGAN-a
 """
 
 import time
+import os
+import torch
+import numpy as np
 from options.train_options import TrainOptions
 from data import create_dataset
 from models import create_model
 from util.visualizer import Visualizer
-from util.util import init_ddp, cleanup_ddp
+from util.util import init_ddp, cleanup_ddp, tensor2im, save_image
 
 
 if __name__ == "__main__":
@@ -83,5 +86,65 @@ if __name__ == "__main__":
             model.save_networks(epoch)
 
         print(f"End of epoch {epoch} / {opt.n_epochs + opt.n_epochs_decay} \t Time Taken: {time.time() - epoch_start_time:.0f} sec")
+
+    # After training completes, process all training images for visual verification
+    print("\n" + "="*50)
+    print("Processing all training images for visual verification...")
+    print("="*50)
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Create output directory for training results
+    results_dir = os.path.join(opt.checkpoints_dir, opt.name, "training_results")
+    os.makedirs(results_dir, exist_ok=True)
+    print(f"Saving results to: {results_dir}")
+    
+    # Process all training images
+    with torch.no_grad():
+        for i, data in enumerate(dataset):
+            model.set_input(data)
+            model.test()  # This calls forward() and compute_visuals()
+            
+            # Get the generated images
+            visuals = model.get_current_visuals()
+            
+            # Get image path to extract filename
+            image_path = model.get_image_paths()[0]
+            filename = os.path.basename(image_path)
+            name, ext = os.path.splitext(filename)
+            
+            # Get all three images: input (real_A), output (fake_B), and ground truth (real_B)
+            images_to_combine = []
+            
+            if "real_A" in visuals:
+                real_A_tensor = visuals["real_A"]
+                # Extract only RGB channels (first 3) if real_A has 4 channels (RGB + Canny)
+                if real_A_tensor.shape[1] == 4:
+                    real_A_tensor = real_A_tensor[:, :3, :, :]  # Take only first 3 channels
+                real_A_img = tensor2im(real_A_tensor)
+                images_to_combine.append(real_A_img)
+            
+            if "fake_B" in visuals:
+                fake_B_img = tensor2im(visuals["fake_B"])
+                images_to_combine.append(fake_B_img)
+            
+            if "real_B" in visuals:
+                real_B_img = tensor2im(visuals["real_B"])
+                images_to_combine.append(real_B_img)
+            
+            # Concatenate images horizontally: original | result | target
+            if len(images_to_combine) == 3:
+                combined_img = np.concatenate(images_to_combine, axis=1)
+                save_image(combined_img, os.path.join(results_dir, f"{name}_comparison{ext}"))
+            else:
+                print(f"Warning: Expected 3 images but got {len(images_to_combine)} for {filename}")
+            
+            if (i + 1) % 10 == 0:
+                print(f"Processed {i + 1}/{dataset_size} images...")
+    
+    print(f"\nCompleted! Processed {dataset_size} training images.")
+    print(f"Results saved to: {results_dir}")
+    print("="*50 + "\n")
 
     cleanup_ddp()
