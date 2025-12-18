@@ -161,17 +161,11 @@ if __name__ == "__main__":
                 print(f"Skipping {filename}: Failed to read original image.")
                 continue
             
-            # Compute Canny edges from original image (before padding, for better edge detection)
-            img_a_gray = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
-            canny_edges = cv2.Canny(img_a_gray, threshold1=50, threshold2=150)
-            
             # Resize with padding to 512x512 (same as preprocess_data.py)
             img_a_padded = resize_with_padding(img_a, size=opt.crop_size, interpolation=cv2.INTER_AREA)
-            canny_padded = resize_with_padding(canny_edges, size=opt.crop_size, interpolation=cv2.INTER_NEAREST)
             
-            # Convert to PIL Images
+            # Convert to PIL Image
             img_a_pil = PILImage.fromarray(cv2.cvtColor(img_a_padded, cv2.COLOR_BGR2RGB))
-            canny_pil = PILImage.fromarray(canny_padded).convert("L")
             
             # Apply normalization transforms only (images are already 512x512 from padding)
             # Create simple transform that just normalizes (no resize/crop since already correct size)
@@ -179,19 +173,11 @@ if __name__ == "__main__":
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
             ])
-            normalize_canny = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.5,), (0.5,))
-            ])
             
-            A_tensor = normalize_A(img_a_pil)  # [3, H, W] in range [-1, 1]
-            canny_tensor = normalize_canny(canny_pil)  # [1, H, W] in range [-1, 1]
-            
-            # Concatenate A (3 channels) with Canny (1 channel) to get 4 channels
-            A_4ch = torch.cat([A_tensor, canny_tensor], dim=0).unsqueeze(0).to(opt.device)  # [1, 4, H, W]
+            A_tensor = normalize_A(img_a_pil).unsqueeze(0).to(opt.device)  # [1, 3, H, W] in range [-1, 1]
             
             # Run model inference
-            model.real_A = A_4ch
+            model.real_A = A_tensor
             model.forward()  # This sets model.fake_B
             fake_B_tensor = model.fake_B  # [1, C, H, W]
             
@@ -214,7 +200,7 @@ if __name__ == "__main__":
             B_tensor = normalize_B(img_b_pil).unsqueeze(0).to(opt.device)  # [1, C, H, W]
             
             # Convert to images for display
-            real_A_img = tensor2im(A_tensor.unsqueeze(0))  # Extract RGB only
+            real_A_img = tensor2im(A_tensor)
             fake_B_img = tensor2im(fake_B_tensor)
             real_B_img = tensor2im(B_tensor)
             
