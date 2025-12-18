@@ -23,11 +23,15 @@ import time
 import os
 import torch
 import numpy as np
+import cv2
+import torchvision.transforms as transforms
+from PIL import Image as PILImage
 from options.train_options import TrainOptions
 from data import create_dataset
 from models import create_model
 from util.visualizer import Visualizer
-from util.util import init_ddp, cleanup_ddp, tensor2im, save_image
+from util.util import init_ddp, cleanup_ddp, tensor2im
+from data.base_dataset import get_transform
 
 
 if __name__ == "__main__":
@@ -100,50 +104,129 @@ if __name__ == "__main__":
     os.makedirs(results_dir, exist_ok=True)
     print(f"Saving results to: {results_dir}")
     
-    # Process all training images
+    # Load original images from dataset/originals
+    originals_dir = os.path.join(opt.dataroot.replace(opt.phase, "").rstrip("/"), "originals")
+    if not os.path.exists(originals_dir):
+        # Try alternative path
+        originals_dir = "dataset/originals"
+    
+    line_drawings_dir = os.path.join(opt.dataroot.replace(opt.phase, "").rstrip("/"), "line_drawings")
+    if not os.path.exists(line_drawings_dir):
+        # Try alternative path
+        line_drawings_dir = "dataset/line_drawings"
+    
+    # Get list of original images
+    original_files = sorted([f for f in os.listdir(originals_dir) 
+                           if f.lower().endswith((".png", ".jpg", ".jpeg"))])
+    
+    # Helper function to resize with padding (same as preprocess_data.py)
+    def resize_with_padding(img, size=512, interpolation=cv2.INTER_AREA):
+        """Resize image to size x size maintaining aspect ratio with padding."""
+        h, w = img.shape[:2]
+        scale = min(size / w, size / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+        
+        if len(img.shape) == 3:
+            canvas = np.zeros((size, size, 3), dtype=img.dtype)
+        else:
+            canvas = np.zeros((size, size), dtype=img.dtype)
+        
+        paste_x = (size - new_w) // 2
+        paste_y = (size - new_h) // 2
+        
+        if len(img.shape) == 3:
+            canvas[paste_y : paste_y + new_h, paste_x : paste_x + new_w] = resized
+        else:
+            canvas[paste_y : paste_y + new_h, paste_x : paste_x + new_w] = resized
+        
+        return canvas
+    
+    # Process all original images
     with torch.no_grad():
-        for i, data in enumerate(dataset):
-            model.set_input(data)
-            model.test()  # This calls forward() and compute_visuals()
+        for i, filename in enumerate(original_files):
+            original_path = os.path.join(originals_dir, filename)
+            line_drawing_path = os.path.join(line_drawings_dir, filename)
             
-            # Get the generated images
-            visuals = model.get_current_visuals()
+            if not os.path.exists(line_drawing_path):
+                print(f"Skipping {filename}: No matching line drawing found.")
+                continue
             
-            # Get image path to extract filename
-            image_path = model.get_image_paths()[0]
-            filename = os.path.basename(image_path)
             name, ext = os.path.splitext(filename)
             
-            # Get all three images: input (real_A), output (fake_B), and ground truth (real_B)
-            images_to_combine = []
+            # Load and preprocess original image (same as preprocess_data.py)
+            img_a = cv2.imread(original_path)
+            if img_a is None:
+                print(f"Skipping {filename}: Failed to read original image.")
+                continue
             
-            if "real_A" in visuals:
-                real_A_tensor = visuals["real_A"]
-                # Extract only RGB channels (first 3) if real_A has 4 channels (RGB + Canny)
-                if real_A_tensor.shape[1] == 4:
-                    real_A_tensor = real_A_tensor[:, :3, :, :]  # Take only first 3 channels
-                real_A_img = tensor2im(real_A_tensor)
-                images_to_combine.append(real_A_img)
+            # Compute Canny edges from original image (before padding, for better edge detection)
+            img_a_gray = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
+            canny_edges = cv2.Canny(img_a_gray, threshold1=50, threshold2=150)
             
-            if "fake_B" in visuals:
-                fake_B_img = tensor2im(visuals["fake_B"])
-                images_to_combine.append(fake_B_img)
+            # Resize with padding to 512x512 (same as preprocess_data.py)
+            img_a_padded = resize_with_padding(img_a, size=opt.crop_size, interpolation=cv2.INTER_AREA)
+            canny_padded = resize_with_padding(canny_edges, size=opt.crop_size, interpolation=cv2.INTER_NEAREST)
             
-            if "real_B" in visuals:
-                real_B_img = tensor2im(visuals["real_B"])
-                images_to_combine.append(real_B_img)
+            # Convert to PIL Images
+            img_a_pil = PILImage.fromarray(cv2.cvtColor(img_a_padded, cv2.COLOR_BGR2RGB))
+            canny_pil = PILImage.fromarray(canny_padded).convert("L")
+            
+            # Apply normalization transforms only (images are already 512x512 from padding)
+            # Create simple transform that just normalizes (no resize/crop since already correct size)
+            normalize_A = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            ])
+            normalize_canny = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,), (0.5,))
+            ])
+            
+            A_tensor = normalize_A(img_a_pil)  # [3, H, W] in range [-1, 1]
+            canny_tensor = normalize_canny(canny_pil)  # [1, H, W] in range [-1, 1]
+            
+            # Concatenate A (3 channels) with Canny (1 channel) to get 4 channels
+            A_4ch = torch.cat([A_tensor, canny_tensor], dim=0).unsqueeze(0).to(opt.device)  # [1, 4, H, W]
+            
+            # Run model inference
+            model.real_A = A_4ch
+            model.forward()  # This sets model.fake_B
+            fake_B_tensor = model.fake_B  # [1, C, H, W]
+            
+            # Load and preprocess ground truth line drawing
+            img_b = cv2.imread(line_drawing_path)
+            if img_b is None:
+                print(f"Skipping {filename}: Failed to read line drawing.")
+                continue
+            
+            img_b_padded = resize_with_padding(img_b, size=opt.crop_size, interpolation=cv2.INTER_NEAREST)
+            img_b_pil = PILImage.fromarray(cv2.cvtColor(img_b_padded, cv2.COLOR_BGR2RGB))
+            if opt.output_nc == 1:
+                img_b_pil = img_b_pil.convert("L")
+            
+            normalize_B = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,) if opt.output_nc == 1 else (0.5, 0.5, 0.5),
+                                   (0.5,) if opt.output_nc == 1 else (0.5, 0.5, 0.5))
+            ])
+            B_tensor = normalize_B(img_b_pil).unsqueeze(0).to(opt.device)  # [1, C, H, W]
+            
+            # Convert to images for display
+            real_A_img = tensor2im(A_tensor.unsqueeze(0))  # Extract RGB only
+            fake_B_img = tensor2im(fake_B_tensor)
+            real_B_img = tensor2im(B_tensor)
             
             # Concatenate images horizontally: original | result | target
-            if len(images_to_combine) == 3:
-                combined_img = np.concatenate(images_to_combine, axis=1)
-                save_image(combined_img, os.path.join(results_dir, f"{name}_comparison{ext}"))
-            else:
-                print(f"Warning: Expected 3 images but got {len(images_to_combine)} for {filename}")
+            combined_img = np.concatenate([real_A_img, fake_B_img, real_B_img], axis=1)
+            combined_pil = PILImage.fromarray(combined_img)
+            combined_pil.save(os.path.join(results_dir, f"{name}_comparison{ext}"))
             
             if (i + 1) % 10 == 0:
-                print(f"Processed {i + 1}/{dataset_size} images...")
+                print(f"Processed {i + 1}/{len(original_files)} images...")
     
-    print(f"\nCompleted! Processed {dataset_size} training images.")
+    print(f"\nCompleted! Processed {len(original_files)} images.")
     print(f"Results saved to: {results_dir}")
     print("="*50 + "\n")
 
