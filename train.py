@@ -105,10 +105,11 @@ if __name__ == "__main__":
     print(f"Saving results to: {results_dir}")
     
     # Get the list of images that were actually used during training
-    # The dataset contains aligned images (A|B side-by-side), we need to extract the filenames
+    # The dataset is a DataLoader, access the underlying dataset via .dataset
+    underlying_dataset = dataset.dataset
     training_image_paths = []
-    for i in range(len(dataset)):
-        data = dataset[i]
+    for i in range(len(underlying_dataset)):
+        data = underlying_dataset[i]
         image_path = data.get("A_paths", None) or data.get("B_paths", None)
         if image_path:
             training_image_paths.append(image_path)
